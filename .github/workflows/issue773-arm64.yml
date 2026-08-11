@@ -1,4 +1,4 @@
-name: Issue 773 Metal Availability Probe
+name: Issue 773 Metal GSM8K Repro
 
 on:
   workflow_dispatch:
@@ -7,13 +7,13 @@ on:
       - issue773-repro
 
 jobs:
-  metal-probe:
+  metal-gsm8k:
     runs-on: macos-15
-    timeout-minutes: 15
+    timeout-minutes: 60
 
     steps:
       # ============================================================
-      # 1. Checkout reporter's Cactus version
+      # 1. Checkout Cactus and pin reporter's engine commit
       # ============================================================
 
       - name: Checkout
@@ -31,7 +31,7 @@ jobs:
           git log -1 --oneline
 
       # ============================================================
-      # 2. Inspect Apple runner
+      # 2. Machine / Metal info
       # ============================================================
 
       - name: Show machine info
@@ -50,14 +50,14 @@ jobs:
           system_profiler SPHardwareDataType
 
           echo
-          echo "===== DISPLAY / GPU ====="
+          echo "===== GPU ====="
           system_profiler SPDisplaysDataType || true
 
-      # ============================================================
-      # 3. Check whether macOS runner exposes a real Metal device
-      # ============================================================
+          echo
+          echo "===== DISK ====="
+          df -h
 
-      - name: Probe Metal device
+      - name: Verify Metal device
         run: |
           cat > /tmp/metal_probe.swift <<'SWIFT'
           import Foundation
@@ -66,8 +66,6 @@ jobs:
           if let device = MTLCreateSystemDefaultDevice() {
               print("METAL_AVAILABLE=YES")
               print("METAL_DEVICE=\(device.name)")
-              print("LOW_POWER=\(device.isLowPower)")
-              print("REMOVABLE=\(device.isRemovable)")
           } else {
               print("METAL_AVAILABLE=NO")
               exit(1)
@@ -77,14 +75,14 @@ jobs:
           swift /tmp/metal_probe.swift
 
       # ============================================================
-      # 4. Build old Cactus runtime on macOS ARM64
+      # 3. Build reporter's Cactus runtime
       # ============================================================
 
       - name: Install dependencies
         run: |
           brew install python@3.12 cmake
 
-      - name: Build Cactus
+      - name: Setup and build Cactus
         shell: bash
         run: |
           source ./setup
@@ -95,11 +93,7 @@ jobs:
           file cactus-engine/build/libcactus_engine.dylib
           ls -lh cactus-engine/build/libcactus_engine.dylib
 
-      # ============================================================
-      # 5. Check Cactus itself accepts Metal backend
-      # ============================================================
-
-      - name: Probe Cactus Metal backend
+      - name: Verify Cactus Metal backend
         shell: bash
         run: |
           source venv/bin/activate
@@ -108,7 +102,6 @@ jobs:
           from cactus.bindings import cactus as C
 
           rc = C.cactus_set_backend("metal")
-
           print("cactus_set_backend('metal') =", rc)
 
           if rc != 0:
@@ -116,3 +109,209 @@ jobs:
 
           print("CACTUS_METAL_BACKEND=AVAILABLE")
           PY
+
+      # ============================================================
+      # 4. Download tooling
+      # ============================================================
+
+      - name: Install Hugging Face CLI
+        shell: bash
+        run: |
+          source venv/bin/activate
+          python -m pip install -U huggingface_hub
+
+      # ============================================================
+      # 5. Fetch reporter's pinned GSM8K harness
+      # ============================================================
+
+      - name: Fetch pinned GSM8K harness
+        run: |
+          git clone \
+            https://github.com/john-rocky/apple-silicon-llm-bench.git \
+            "$RUNNER_TEMP/llm-bench"
+
+          cd "$RUNNER_TEMP/llm-bench"
+
+          git checkout fab4074629bd87116c405e5073f91bc3524b5eff
+
+          echo "===== HARNESS COMMIT ====="
+          git rev-parse HEAD
+
+          echo
+          echo "===== GSM8K DATA ====="
+          ls -lh evaldata/gsm8k_test.jsonl
+
+          echo
+          echo "===== HARNESS ====="
+          ls -lh scripts/parity_gsm8k.py
+
+      # ============================================================
+      # 6. BAD calibrated CQ4
+      # ============================================================
+
+      - name: Download BAD calibrated CQ4
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          mkdir -p "$RUNNER_TEMP/issue773"
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+          echo
+          df -h
+
+      - name: Verify BAD hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | shasum -a 256 -c -
+
+      - name: Extract BAD CQ4
+        run: |
+          mkdir -p "$RUNNER_TEMP/bad_cq4"
+
+          unzip -q \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            -d "$RUNNER_TEMP/bad_cq4"
+
+          echo "===== BAD BUNDLE ====="
+          find "$RUNNER_TEMP/bad_cq4" -name config.txt
+
+          echo
+          du -sh "$RUNNER_TEMP/bad_cq4"
+          df -h
+
+      - name: Run BAD GSM8K n=10 on Metal
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          mkdir -p "$RUNNER_TEMP/gsm8k_reports"
+
+          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend metal \
+            --n 10 \
+            --max-tokens 1024 \
+            --tag bad-cq4-old-engine-metal \
+            | tee bad_metal.txt
+
+      # ============================================================
+      # 7. Delete BAD completely before downloading GOOD
+      # ============================================================
+
+      - name: Remove BAD CQ4
+        run: |
+          rm -rf "$RUNNER_TEMP/bad_cq4"
+          rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
+
+          echo "===== DISK AFTER BAD CLEANUP ====="
+          df -h
+
+      # ============================================================
+      # 8. GOOD previous uncalibrated CQ4
+      # ============================================================
+
+      - name: Download GOOD uncalibrated CQ4
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4-uncalibrated.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+          echo
+          df -h
+
+      - name: Verify GOOD hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
+          | shasum -a 256 -c -
+
+      - name: Extract GOOD CQ4
+        run: |
+          mkdir -p "$RUNNER_TEMP/good_cq4"
+
+          unzip -q \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
+            -d "$RUNNER_TEMP/good_cq4"
+
+          echo "===== GOOD BUNDLE ====="
+          find "$RUNNER_TEMP/good_cq4" -name config.txt
+
+          echo
+          du -sh "$RUNNER_TEMP/good_cq4"
+          df -h
+
+      - name: Run GOOD GSM8K n=10 on Metal
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/good_cq4/gemma-4-e2b-it-cq4" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend metal \
+            --n 10 \
+            --max-tokens 1024 \
+            --tag good-cq4-old-engine-metal \
+            | tee good_metal.txt
+
+      # ============================================================
+      # 9. Comparison
+      # ============================================================
+
+      - name: Print Metal comparison
+        run: |
+          echo
+          echo "=========================================="
+          echo "BAD CQ4 — ENGINE 1ace6d78 — METAL"
+          echo "=========================================="
+          cat bad_metal.txt
+
+          echo
+          echo "=========================================="
+          echo "GOOD CQ4 — ENGINE 1ace6d78 — METAL"
+          echo "=========================================="
+          cat good_metal.txt
+
+          echo
+          echo "=========================================="
+          echo "AGGREGATE JSON"
+          echo "=========================================="
+          cat "$RUNNER_TEMP/gsm8k_reports/gsm8k_bad-cq4-old-engine-metal.json"
+          echo
+          cat "$RUNNER_TEMP/gsm8k_reports/gsm8k_good-cq4-old-engine-metal.json"
+
+      # ============================================================
+      # 10. Save logs/results
+      # ============================================================
+
+      - name: Collect result files
+        run: |
+          mkdir -p issue773_results
+
+          cp bad_metal.txt issue773_results/
+          cp good_metal.txt issue773_results/
+
+          cp "$RUNNER_TEMP/gsm8k_reports/"*.json issue773_results/
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue773-metal-n10-results
+          path: issue773_results/
