@@ -1,4 +1,4 @@
-name: Issue 773 ARM64 Repro
+name: Issue 773 GSM8K ARM64 Repro
 
 on:
   workflow_dispatch:
@@ -7,18 +7,33 @@ on:
       - issue773-repro
 
 jobs:
-  arm64-repro:
+  gsm8k-repro:
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      # ============================================================
+      # 1. Checkout current Cactus engine
+      # ============================================================
+
+      - name: Checkout Cactus
         uses: actions/checkout@v4
 
-      - name: Show machine info
+      - name: Show machine and Cactus version
         run: |
+          echo "===== MACHINE ====="
           uname -a
           uname -m
           lscpu
+
+          echo
+          echo "===== CACTUS COMMIT ====="
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      # ============================================================
+      # 2. Build Cactus natively on ARM64
+      # ============================================================
 
       - name: Install system dependencies
         run: |
@@ -30,7 +45,8 @@ jobs:
             python3 \
             python3-venv \
             python3-pip \
-            unzip
+            unzip \
+            git
 
       - name: Setup Cactus and build Python runtime
         shell: bash
@@ -38,15 +54,51 @@ jobs:
           source ./setup
           cactus build --python
 
+          echo
+          echo "===== RUNTIME LIBRARY ====="
+          file cactus-engine/build/libcactus_engine.so
+          ls -lh cactus-engine/build/libcactus_engine.so
+
+      # ============================================================
+      # 3. Install download tooling
+      # ============================================================
+
       - name: Install Hugging Face CLI
         shell: bash
         run: |
           source venv/bin/activate
           python -m pip install -U huggingface_hub
 
-      # ------------------------------------------------------------
-      # BAD / calibrated CQ4
-      # ------------------------------------------------------------
+      # ============================================================
+      # 4. Fetch reporter's canonical GSM8K harness
+      # ============================================================
+
+      - name: Fetch pinned GSM8K harness
+        run: |
+          git clone \
+            https://github.com/john-rocky/apple-silicon-llm-bench.git \
+            "$RUNNER_TEMP/llm-bench"
+
+          cd "$RUNNER_TEMP/llm-bench"
+
+          # July 20 canonical harness + scoring fixes
+          git checkout fab4074629bd87116c405e5073f91bc3524b5eff
+
+          echo
+          echo "===== HARNESS COMMIT ====="
+          git rev-parse HEAD
+
+          echo
+          echo "===== GSM8K FILE ====="
+          ls -lh evaldata/gsm8k_test.jsonl
+
+          echo
+          echo "===== HARNESS ====="
+          ls -lh scripts/parity_gsm8k.py
+
+      # ============================================================
+      # 5. BAD CQ4 — calibrated artifact
+      # ============================================================
 
       - name: Download BAD calibrated CQ4
         shell: bash
@@ -67,7 +119,7 @@ jobs:
           "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
           | sha256sum -c -
 
-      - name: Extract BAD bundle
+      - name: Extract BAD CQ4
         run: |
           mkdir -p "$RUNNER_TEMP/bad_cq4"
 
@@ -75,27 +127,39 @@ jobs:
             "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
             -d "$RUNNER_TEMP/bad_cq4"
 
+          echo "===== BAD CONFIG ====="
           find "$RUNNER_TEMP/bad_cq4" -name config.txt
 
-      - name: Run BAD sanity test
+      - name: Run BAD GSM8K n=10
         shell: bash
         run: |
           source venv/bin/activate
 
-          python issue773_sanity.py \
-            "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
-            | tee bad_results.txt
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend cpu \
+            --n 10 \
+            --max-tokens 1024 \
+            --tag bad-cq4-current-engine-cpu \
+            | tee bad_gsm8k.txt
 
-      - name: Delete BAD bundle
+      # ============================================================
+      # 6. Free disk before GOOD model
+      # ============================================================
+
+      - name: Remove BAD CQ4
         run: |
           rm -rf "$RUNNER_TEMP/bad_cq4"
           rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
 
+          echo "===== DISK AFTER BAD ====="
           df -h
 
-      # ------------------------------------------------------------
-      # GOOD / previous uncalibrated CQ4
-      # ------------------------------------------------------------
+      # ============================================================
+      # 7. GOOD CQ4 — previous uncalibrated artifact
+      # ============================================================
 
       - name: Download GOOD uncalibrated CQ4
         shell: bash
@@ -114,7 +178,7 @@ jobs:
           "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
           | sha256sum -c -
 
-      - name: Extract GOOD bundle
+      - name: Extract GOOD CQ4
         run: |
           mkdir -p "$RUNNER_TEMP/good_cq4"
 
@@ -122,30 +186,50 @@ jobs:
             "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
             -d "$RUNNER_TEMP/good_cq4"
 
+          echo "===== GOOD CONFIG ====="
           find "$RUNNER_TEMP/good_cq4" -name config.txt
 
-      - name: Run GOOD sanity test
+      - name: Run GOOD GSM8K n=10
         shell: bash
         run: |
           source venv/bin/activate
 
-          python issue773_sanity.py \
-            "$RUNNER_TEMP/good_cq4/gemma-4-e2b-it-cq4" \
-            | tee good_results.txt
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/good_cq4/gemma-4-e2b-it-cq4" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend cpu \
+            --n 10 \
+            --max-tokens 1024 \
+            --tag good-cq4-current-engine-cpu \
+            | tee good_gsm8k.txt
 
-      - name: Print comparison
+      # ============================================================
+      # 8. Print A/B result
+      # ============================================================
+
+      - name: Print GSM8K comparison
         run: |
-          echo "================ BAD CQ4 ================"
-          cat bad_results.txt
+          echo
+          echo "=========================================="
+          echo "BAD CALIBRATED CQ4"
+          echo "=========================================="
+          cat bad_gsm8k.txt
 
           echo
-          echo "================ GOOD CQ4 ================"
-          cat good_results.txt
+          echo "=========================================="
+          echo "GOOD UNCALIBRATED CQ4"
+          echo "=========================================="
+          cat good_gsm8k.txt
 
-      - name: Upload results
+      # ============================================================
+      # 9. Save logs
+      # ============================================================
+
+      - name: Upload GSM8K results
         uses: actions/upload-artifact@v4
         with:
-          name: issue773-sanity-results
+          name: issue773-gsm8k-n10-results
           path: |
-            bad_results.txt
-            good_results.txt
+            bad_gsm8k.txt
+            good_gsm8k.txt
