@@ -1,0 +1,40 @@
+name: Issue 773 ARM64 Repro
+
+on:
+  workflow_dispatch:
+
+jobs:
+  arm64-build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show machine info
+        run: |
+          uname -a
+          uname -m
+          lscpu
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libcurl4-openssl-dev \
+            python3 \
+            python3-venv \
+            python3-pip
+
+      - name: Setup Cactus and build Python runtime
+        shell: bash
+        run: |
+          source ./setup
+          cactus build --python
+
+      - name: Verify runtime library
+        run: |
+          file cactus-engine/build/libcactus_engine.so
+          ls -lh cactus-engine/build/libcactus_engine.so
