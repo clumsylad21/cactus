@@ -2,6 +2,11 @@ name: Issue 773 ARM64 Repro
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - issue773-repro
+
+
 
 jobs:
   arm64-build:
