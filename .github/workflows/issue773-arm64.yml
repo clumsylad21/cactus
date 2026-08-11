@@ -1,4 +1,4 @@
-name: Issue 773 GSM8K ARM64 Repro
+name: Issue 773 Old Engine GSM8K Repro
 
 on:
   workflow_dispatch:
@@ -7,32 +7,40 @@ on:
       - issue773-repro
 
 jobs:
-  gsm8k-repro:
+  old-engine-gsm8k:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
 
     steps:
       # ============================================================
-      # 1. Checkout current Cactus engine
+      # 1. Checkout repo, then move runtime to reporter's engine SHA
       # ============================================================
 
-      - name: Checkout Cactus
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Show machine and Cactus version
+      - name: Checkout reporter Cactus engine commit
+        run: |
+          git fetch https://github.com/cactus-compute/cactus.git \
+            1ace6d78767ab84e4ea3feb0d4d99a36ab884a3b
+
+          git checkout 1ace6d78767ab84e4ea3feb0d4d99a36ab884a3b
+
+          echo "===== CACTUS ENGINE COMMIT ====="
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      - name: Show machine info
         run: |
           echo "===== MACHINE ====="
           uname -a
           uname -m
           lscpu
 
-          echo
-          echo "===== CACTUS COMMIT ====="
-          git rev-parse HEAD
-          git log -1 --oneline
-
       # ============================================================
-      # 2. Build Cactus natively on ARM64
+      # 2. Build OLD Cactus engine natively on ARM64
       # ============================================================
 
       - name: Install system dependencies
@@ -48,7 +56,7 @@ jobs:
             unzip \
             git
 
-      - name: Setup Cactus and build Python runtime
+      - name: Setup old Cactus and build Python runtime
         shell: bash
         run: |
           source ./setup
@@ -60,7 +68,7 @@ jobs:
           ls -lh cactus-engine/build/libcactus_engine.so
 
       # ============================================================
-      # 3. Install download tooling
+      # 3. Tools
       # ============================================================
 
       - name: Install Hugging Face CLI
@@ -70,7 +78,7 @@ jobs:
           python -m pip install -U huggingface_hub
 
       # ============================================================
-      # 4. Fetch reporter's canonical GSM8K harness
+      # 4. Reporter GSM8K harness
       # ============================================================
 
       - name: Fetch pinned GSM8K harness
@@ -81,23 +89,18 @@ jobs:
 
           cd "$RUNNER_TEMP/llm-bench"
 
-          # July 20 canonical harness + scoring fixes
           git checkout fab4074629bd87116c405e5073f91bc3524b5eff
 
-          echo
           echo "===== HARNESS COMMIT ====="
           git rev-parse HEAD
 
           echo
-          echo "===== GSM8K FILE ====="
+          echo "===== PINNED GSM8K ====="
           ls -lh evaldata/gsm8k_test.jsonl
-
-          echo
-          echo "===== HARNESS ====="
           ls -lh scripts/parity_gsm8k.py
 
       # ============================================================
-      # 5. BAD CQ4 — calibrated artifact
+      # 5. BAD calibrated CQ4
       # ============================================================
 
       - name: Download BAD calibrated CQ4
@@ -111,7 +114,7 @@ jobs:
             gemma-4-e2b-it-cq4.zip \
             --local-dir "$RUNNER_TEMP/issue773"
 
-      - name: Verify BAD artifact hash
+      - name: Verify BAD hash
         run: |
           cd "$RUNNER_TEMP/issue773"
 
@@ -127,7 +130,6 @@ jobs:
             "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
             -d "$RUNNER_TEMP/bad_cq4"
 
-          echo "===== BAD CONFIG ====="
           find "$RUNNER_TEMP/bad_cq4" -name config.txt
 
       - name: Run BAD GSM8K n=10
@@ -142,11 +144,11 @@ jobs:
             --cactus-backend cpu \
             --n 10 \
             --max-tokens 1024 \
-            --tag bad-cq4-current-engine-cpu \
-            | tee bad_gsm8k.txt
+            --tag bad-cq4-old-engine-cpu \
+            | tee bad_old_engine.txt
 
       # ============================================================
-      # 6. Free disk before GOOD model
+      # 6. Remove BAD to save disk
       # ============================================================
 
       - name: Remove BAD CQ4
@@ -154,11 +156,10 @@ jobs:
           rm -rf "$RUNNER_TEMP/bad_cq4"
           rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
 
-          echo "===== DISK AFTER BAD ====="
           df -h
 
       # ============================================================
-      # 7. GOOD CQ4 — previous uncalibrated artifact
+      # 7. GOOD uncalibrated CQ4
       # ============================================================
 
       - name: Download GOOD uncalibrated CQ4
@@ -170,7 +171,7 @@ jobs:
             gemma-4-e2b-it-cq4-uncalibrated.zip \
             --local-dir "$RUNNER_TEMP/issue773"
 
-      - name: Verify GOOD artifact hash
+      - name: Verify GOOD hash
         run: |
           cd "$RUNNER_TEMP/issue773"
 
@@ -186,7 +187,6 @@ jobs:
             "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
             -d "$RUNNER_TEMP/good_cq4"
 
-          echo "===== GOOD CONFIG ====="
           find "$RUNNER_TEMP/good_cq4" -name config.txt
 
       - name: Run GOOD GSM8K n=10
@@ -201,35 +201,35 @@ jobs:
             --cactus-backend cpu \
             --n 10 \
             --max-tokens 1024 \
-            --tag good-cq4-current-engine-cpu \
-            | tee good_gsm8k.txt
+            --tag good-cq4-old-engine-cpu \
+            | tee good_old_engine.txt
 
       # ============================================================
-      # 8. Print A/B result
+      # 8. Compare
       # ============================================================
 
-      - name: Print GSM8K comparison
+      - name: Print old-engine comparison
         run: |
           echo
           echo "=========================================="
-          echo "BAD CALIBRATED CQ4"
+          echo "BAD CQ4 — ENGINE 1ace6d78 — CPU"
           echo "=========================================="
-          cat bad_gsm8k.txt
+          cat bad_old_engine.txt
 
           echo
           echo "=========================================="
-          echo "GOOD UNCALIBRATED CQ4"
+          echo "GOOD CQ4 — ENGINE 1ace6d78 — CPU"
           echo "=========================================="
-          cat good_gsm8k.txt
+          cat good_old_engine.txt
 
       # ============================================================
-      # 9. Save logs
+      # 9. Save result logs
       # ============================================================
 
-      - name: Upload GSM8K results
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: issue773-gsm8k-n10-results
+          name: issue773-old-engine-cpu-n10
           path: |
-            bad_gsm8k.txt
-            good_gsm8k.txt
+            bad_old_engine.txt
+            good_old_engine.txt
