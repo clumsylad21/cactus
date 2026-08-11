@@ -6,10 +6,8 @@ on:
     branches:
       - issue773-repro
 
-
-
 jobs:
-  arm64-build:
+  arm64-repro:
     runs-on: ubuntu-24.04-arm
 
     steps:
@@ -31,7 +29,8 @@ jobs:
             libcurl4-openssl-dev \
             python3 \
             python3-venv \
-            python3-pip
+            python3-pip \
+            unzip
 
       - name: Setup Cactus and build Python runtime
         shell: bash
@@ -39,7 +38,114 @@ jobs:
           source ./setup
           cactus build --python
 
-      - name: Verify runtime library
+      - name: Install Hugging Face CLI
+        shell: bash
         run: |
-          file cactus-engine/build/libcactus_engine.so
-          ls -lh cactus-engine/build/libcactus_engine.so
+          source venv/bin/activate
+          python -m pip install -U huggingface_hub
+
+      # ------------------------------------------------------------
+      # BAD / calibrated CQ4
+      # ------------------------------------------------------------
+
+      - name: Download BAD calibrated CQ4
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          mkdir -p "$RUNNER_TEMP/issue773"
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify BAD artifact hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | sha256sum -c -
+
+      - name: Extract BAD bundle
+        run: |
+          mkdir -p "$RUNNER_TEMP/bad_cq4"
+
+          unzip -q \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            -d "$RUNNER_TEMP/bad_cq4"
+
+          find "$RUNNER_TEMP/bad_cq4" -name config.txt
+
+      - name: Run BAD sanity test
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          python issue773_sanity.py \
+            "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
+            | tee bad_results.txt
+
+      - name: Delete BAD bundle
+        run: |
+          rm -rf "$RUNNER_TEMP/bad_cq4"
+          rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
+
+          df -h
+
+      # ------------------------------------------------------------
+      # GOOD / previous uncalibrated CQ4
+      # ------------------------------------------------------------
+
+      - name: Download GOOD uncalibrated CQ4
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4-uncalibrated.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify GOOD artifact hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
+          | sha256sum -c -
+
+      - name: Extract GOOD bundle
+        run: |
+          mkdir -p "$RUNNER_TEMP/good_cq4"
+
+          unzip -q \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
+            -d "$RUNNER_TEMP/good_cq4"
+
+          find "$RUNNER_TEMP/good_cq4" -name config.txt
+
+      - name: Run GOOD sanity test
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          python issue773_sanity.py \
+            "$RUNNER_TEMP/good_cq4/gemma-4-e2b-it-cq4" \
+            | tee good_results.txt
+
+      - name: Print comparison
+        run: |
+          echo "================ BAD CQ4 ================"
+          cat bad_results.txt
+
+          echo
+          echo "================ GOOD CQ4 ================"
+          cat good_results.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue773-sanity-results
+          path: |
+            bad_results.txt
+            good_results.txt
