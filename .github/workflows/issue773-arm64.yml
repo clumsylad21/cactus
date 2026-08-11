@@ -1,4 +1,4 @@
-name: Issue 773 Old Engine GSM8K Repro
+name: Issue 773 Metal Availability Probe
 
 on:
   workflow_dispatch:
@@ -7,229 +7,112 @@ on:
       - issue773-repro
 
 jobs:
-  old-engine-gsm8k:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+  metal-probe:
+    runs-on: macos-15
+    timeout-minutes: 15
 
     steps:
       # ============================================================
-      # 1. Checkout repo, then move runtime to reporter's engine SHA
+      # 1. Checkout reporter's Cactus version
       # ============================================================
 
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Checkout reporter Cactus engine commit
+      - name: Checkout reporter engine commit
         run: |
           git fetch https://github.com/cactus-compute/cactus.git \
             1ace6d78767ab84e4ea3feb0d4d99a36ab884a3b
 
           git checkout 1ace6d78767ab84e4ea3feb0d4d99a36ab884a3b
 
-          echo "===== CACTUS ENGINE COMMIT ====="
+          echo "===== CACTUS COMMIT ====="
           git rev-parse HEAD
           git log -1 --oneline
 
+      # ============================================================
+      # 2. Inspect Apple runner
+      # ============================================================
+
       - name: Show machine info
         run: |
-          echo "===== MACHINE ====="
+          echo "===== ARCH ====="
           uname -a
           uname -m
-          lscpu
+          arch
+
+          echo
+          echo "===== MACOS ====="
+          sw_vers
+
+          echo
+          echo "===== HARDWARE ====="
+          system_profiler SPHardwareDataType
+
+          echo
+          echo "===== DISPLAY / GPU ====="
+          system_profiler SPDisplaysDataType || true
 
       # ============================================================
-      # 2. Build OLD Cactus engine natively on ARM64
+      # 3. Check whether macOS runner exposes a real Metal device
       # ============================================================
 
-      - name: Install system dependencies
+      - name: Probe Metal device
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            cmake \
-            libcurl4-openssl-dev \
-            python3 \
-            python3-venv \
-            python3-pip \
-            unzip \
-            git
+          cat > /tmp/metal_probe.swift <<'SWIFT'
+          import Foundation
+          import Metal
 
-      - name: Setup old Cactus and build Python runtime
+          if let device = MTLCreateSystemDefaultDevice() {
+              print("METAL_AVAILABLE=YES")
+              print("METAL_DEVICE=\(device.name)")
+              print("LOW_POWER=\(device.isLowPower)")
+              print("REMOVABLE=\(device.isRemovable)")
+          } else {
+              print("METAL_AVAILABLE=NO")
+              exit(1)
+          }
+          SWIFT
+
+          swift /tmp/metal_probe.swift
+
+      # ============================================================
+      # 4. Build old Cactus runtime on macOS ARM64
+      # ============================================================
+
+      - name: Install dependencies
+        run: |
+          brew install python@3.12 cmake
+
+      - name: Build Cactus
         shell: bash
         run: |
           source ./setup
           cactus build --python
 
           echo
-          echo "===== RUNTIME LIBRARY ====="
-          file cactus-engine/build/libcactus_engine.so
-          ls -lh cactus-engine/build/libcactus_engine.so
+          echo "===== CACTUS LIBRARY ====="
+          file cactus-engine/build/libcactus_engine.dylib
+          ls -lh cactus-engine/build/libcactus_engine.dylib
 
       # ============================================================
-      # 3. Tools
+      # 5. Check Cactus itself accepts Metal backend
       # ============================================================
 
-      - name: Install Hugging Face CLI
-        shell: bash
-        run: |
-          source venv/bin/activate
-          python -m pip install -U huggingface_hub
-
-      # ============================================================
-      # 4. Reporter GSM8K harness
-      # ============================================================
-
-      - name: Fetch pinned GSM8K harness
-        run: |
-          git clone \
-            https://github.com/john-rocky/apple-silicon-llm-bench.git \
-            "$RUNNER_TEMP/llm-bench"
-
-          cd "$RUNNER_TEMP/llm-bench"
-
-          git checkout fab4074629bd87116c405e5073f91bc3524b5eff
-
-          echo "===== HARNESS COMMIT ====="
-          git rev-parse HEAD
-
-          echo
-          echo "===== PINNED GSM8K ====="
-          ls -lh evaldata/gsm8k_test.jsonl
-          ls -lh scripts/parity_gsm8k.py
-
-      # ============================================================
-      # 5. BAD calibrated CQ4
-      # ============================================================
-
-      - name: Download BAD calibrated CQ4
+      - name: Probe Cactus Metal backend
         shell: bash
         run: |
           source venv/bin/activate
 
-          mkdir -p "$RUNNER_TEMP/issue773"
+          python - <<'PY'
+          from cactus.bindings import cactus as C
 
-          hf download Cactus-Compute/gemma-4-E2B-it \
-            gemma-4-e2b-it-cq4.zip \
-            --local-dir "$RUNNER_TEMP/issue773"
+          rc = C.cactus_set_backend("metal")
 
-      - name: Verify BAD hash
-        run: |
-          cd "$RUNNER_TEMP/issue773"
+          print("cactus_set_backend('metal') =", rc)
 
-          echo \
-          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
-          | sha256sum -c -
+          if rc != 0:
+              raise SystemExit("Cactus rejected Metal backend")
 
-      - name: Extract BAD CQ4
-        run: |
-          mkdir -p "$RUNNER_TEMP/bad_cq4"
-
-          unzip -q \
-            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
-            -d "$RUNNER_TEMP/bad_cq4"
-
-          find "$RUNNER_TEMP/bad_cq4" -name config.txt
-
-      - name: Run BAD GSM8K n=10
-        shell: bash
-        run: |
-          source venv/bin/activate
-
-          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
-            --which cactus \
-            --bundle "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
-            --cactus-repo "$GITHUB_WORKSPACE" \
-            --cactus-backend cpu \
-            --n 10 \
-            --max-tokens 1024 \
-            --tag bad-cq4-old-engine-cpu \
-            | tee bad_old_engine.txt
-
-      # ============================================================
-      # 6. Remove BAD to save disk
-      # ============================================================
-
-      - name: Remove BAD CQ4
-        run: |
-          rm -rf "$RUNNER_TEMP/bad_cq4"
-          rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
-
-          df -h
-
-      # ============================================================
-      # 7. GOOD uncalibrated CQ4
-      # ============================================================
-
-      - name: Download GOOD uncalibrated CQ4
-        shell: bash
-        run: |
-          source venv/bin/activate
-
-          hf download Cactus-Compute/gemma-4-E2B-it \
-            gemma-4-e2b-it-cq4-uncalibrated.zip \
-            --local-dir "$RUNNER_TEMP/issue773"
-
-      - name: Verify GOOD hash
-        run: |
-          cd "$RUNNER_TEMP/issue773"
-
-          echo \
-          "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
-          | sha256sum -c -
-
-      - name: Extract GOOD CQ4
-        run: |
-          mkdir -p "$RUNNER_TEMP/good_cq4"
-
-          unzip -q \
-            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
-            -d "$RUNNER_TEMP/good_cq4"
-
-          find "$RUNNER_TEMP/good_cq4" -name config.txt
-
-      - name: Run GOOD GSM8K n=10
-        shell: bash
-        run: |
-          source venv/bin/activate
-
-          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
-            --which cactus \
-            --bundle "$RUNNER_TEMP/good_cq4/gemma-4-e2b-it-cq4" \
-            --cactus-repo "$GITHUB_WORKSPACE" \
-            --cactus-backend cpu \
-            --n 10 \
-            --max-tokens 1024 \
-            --tag good-cq4-old-engine-cpu \
-            | tee good_old_engine.txt
-
-      # ============================================================
-      # 8. Compare
-      # ============================================================
-
-      - name: Print old-engine comparison
-        run: |
-          echo
-          echo "=========================================="
-          echo "BAD CQ4 — ENGINE 1ace6d78 — CPU"
-          echo "=========================================="
-          cat bad_old_engine.txt
-
-          echo
-          echo "=========================================="
-          echo "GOOD CQ4 — ENGINE 1ace6d78 — CPU"
-          echo "=========================================="
-          cat good_old_engine.txt
-
-      # ============================================================
-      # 9. Save result logs
-      # ============================================================
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: issue773-old-engine-cpu-n10
-          path: |
-            bad_old_engine.txt
-            good_old_engine.txt
+          print("CACTUS_METAL_BACKEND=AVAILABLE")
+          PY
