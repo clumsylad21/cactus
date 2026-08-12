@@ -1,0 +1,326 @@
+name: Issue 773 Current Main Metal Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - issue773-repro
+    paths:
+      - ".github/workflows/issue773-current-metal.yml"
+
+jobs:
+  current-metal-validation:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      # ============================================================
+      # 1. Checkout CURRENT upstream Cactus main
+      # ============================================================
+
+      - name: Checkout current upstream Cactus
+        uses: actions/checkout@v4
+        with:
+          repository: cactus-compute/cactus
+          ref: main
+
+      - name: Show exact Cactus version
+        run: |
+          echo "=========================================="
+          echo "CURRENT UPSTREAM CACTUS"
+          echo "=========================================="
+
+          git rev-parse HEAD
+          git log -1 --oneline
+
+          echo
+          echo "===== MACHINE ====="
+          uname -a
+          uname -m
+          sw_vers
+
+          echo
+          echo "===== HARDWARE ====="
+          system_profiler SPHardwareDataType
+
+          echo
+          echo "===== GPU ====="
+          system_profiler SPDisplaysDataType || true
+
+      # ============================================================
+      # 2. Verify Metal exists on runner
+      # ============================================================
+
+      - name: Verify Metal device
+        run: |
+          cat > /tmp/metal_probe.swift <<'SWIFT'
+          import Foundation
+          import Metal
+
+          if let device = MTLCreateSystemDefaultDevice() {
+              print("METAL_AVAILABLE=YES")
+              print("METAL_DEVICE=\(device.name)")
+          } else {
+              print("METAL_AVAILABLE=NO")
+              exit(1)
+          }
+          SWIFT
+
+          swift /tmp/metal_probe.swift
+
+      # ============================================================
+      # 3. Build CURRENT Cactus
+      # ============================================================
+
+      - name: Install dependencies
+        run: |
+          brew install python@3.12 cmake
+
+      - name: Setup and build Cactus
+        shell: bash
+        run: |
+          source ./setup
+          cactus build --python
+
+          echo
+          echo "===== CACTUS ENGINE ====="
+
+          if [ -f cactus-engine/build/libcactus_engine.dylib ]; then
+            file cactus-engine/build/libcactus_engine.dylib
+            ls -lh cactus-engine/build/libcactus_engine.dylib
+          fi
+
+      - name: Verify current Cactus Metal backend
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          python - <<'PY'
+          from cactus.bindings import cactus as C
+
+          rc = C.cactus_set_backend("metal")
+
+          print("cactus_set_backend('metal') =", rc)
+
+          if rc != 0:
+              raise SystemExit(
+                  "Current Cactus rejected Metal backend"
+              )
+
+          print("CURRENT_CACTUS_METAL=AVAILABLE")
+          PY
+
+      # ============================================================
+      # 4. Fetch exact reporter GSM8K harness
+      # ============================================================
+
+      - name: Install Hugging Face tooling
+        shell: bash
+        run: |
+          source venv/bin/activate
+          python -m pip install -U huggingface_hub
+
+      - name: Fetch pinned GSM8K harness
+        run: |
+          git clone \
+            https://github.com/john-rocky/apple-silicon-llm-bench.git \
+            "$RUNNER_TEMP/llm-bench"
+
+          cd "$RUNNER_TEMP/llm-bench"
+
+          git checkout \
+            fab4074629bd87116c405e5073f91bc3524b5eff
+
+          echo
+          echo "===== HARNESS COMMIT ====="
+          git rev-parse HEAD
+
+          echo
+          echo "===== GSM8K DATA ====="
+          ls -lh evaldata/gsm8k_test.jsonl
+
+          mkdir -p "$RUNNER_TEMP/gsm8k_reports"
+
+      # ============================================================
+      # 5. GOOD CQ4 control
+      #
+      # Old reporter-engine Metal Q1:
+      # pred=18, gold=18
+      # ============================================================
+
+      - name: Download GOOD uncalibrated CQ4
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          mkdir -p "$RUNNER_TEMP/issue773"
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4-uncalibrated.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify GOOD hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
+          | shasum -a 256 -c -
+
+      - name: Extract GOOD CQ4
+        run: |
+          mkdir -p "$RUNNER_TEMP/good_cq4"
+
+          unzip -q \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
+            -d "$RUNNER_TEMP/good_cq4"
+
+          echo "===== GOOD BUNDLE ====="
+          find "$RUNNER_TEMP/good_cq4" -name config.txt
+
+      - name: Run GOOD GSM8K Q1 on current Metal
+        shell: bash
+        run: |
+          set -o pipefail
+          source venv/bin/activate
+
+          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/good_cq4/gemma-4-e2b-it-cq4" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend metal \
+            --n 1 \
+            --max-tokens 1024 \
+            --tag good-cq4-current-main-metal-q1 \
+            | tee good_current_metal.txt
+
+      - name: Remove GOOD CQ4
+        run: |
+          rm -rf "$RUNNER_TEMP/good_cq4"
+
+          rm -f \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
+
+          df -h
+
+      # ============================================================
+      # 6. BAD calibrated CQ4
+      #
+      # Old reporter-engine Metal Q1:
+      # pred=16, gold=18
+      #
+      # THIS is the decisive current-main test.
+      # ============================================================
+
+      - name: Download BAD calibrated CQ4
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify BAD hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | shasum -a 256 -c -
+
+      - name: Extract BAD CQ4
+        run: |
+          mkdir -p "$RUNNER_TEMP/bad_cq4"
+
+          unzip -q \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            -d "$RUNNER_TEMP/bad_cq4"
+
+          echo "===== BAD BUNDLE ====="
+          find "$RUNNER_TEMP/bad_cq4" -name config.txt
+
+      - name: Run BAD GSM8K Q1 on current Metal
+        shell: bash
+        run: |
+          set -o pipefail
+          source venv/bin/activate
+
+          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend metal \
+            --n 1 \
+            --max-tokens 1024 \
+            --tag bad-cq4-current-main-metal-q1 \
+            | tee bad_current_metal.txt
+
+      # ============================================================
+      # 7. Print exact comparison
+      # ============================================================
+
+      - name: Print current Metal validation
+        run: |
+          echo
+          echo "=========================================="
+          echo "CURRENT CACTUS COMMIT"
+          echo "=========================================="
+          git rev-parse HEAD
+          git log -1 --oneline
+
+          echo
+          echo "=========================================="
+          echo "GOOD UNCALIBRATED — CURRENT MAIN — METAL"
+          echo "=========================================="
+          cat good_current_metal.txt
+
+          echo
+          echo "=========================================="
+          echo "BAD CALIBRATED — CURRENT MAIN — METAL"
+          echo "=========================================="
+          cat bad_current_metal.txt
+
+          echo
+          echo "=========================================="
+          echo "RESULT JSON"
+          echo "=========================================="
+
+          cat \
+            "$RUNNER_TEMP/gsm8k_reports/gsm8k_good-cq4-current-main-metal-q1.json"
+
+          echo
+
+          cat \
+            "$RUNNER_TEMP/gsm8k_reports/gsm8k_bad-cq4-current-main-metal-q1.json"
+
+      # ============================================================
+      # 8. Save reproducibility evidence
+      # ============================================================
+
+      - name: Collect results
+        run: |
+          mkdir -p issue773_current_metal_results
+
+          git rev-parse HEAD \
+            > issue773_current_metal_results/cactus_commit.txt
+
+          git log -1 --oneline \
+            >> issue773_current_metal_results/cactus_commit.txt
+
+          cp good_current_metal.txt \
+            issue773_current_metal_results/
+
+          cp bad_current_metal.txt \
+            issue773_current_metal_results/
+
+          cp "$RUNNER_TEMP/gsm8k_reports/"*.json \
+            issue773_current_metal_results/
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue773-current-main-metal-q1
+          path: issue773_current_metal_results/
