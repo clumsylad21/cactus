@@ -1,4 +1,4 @@
-name: Issue 773 Metal GSM8K Repro
+name: Issue 773 Metal GSM8K n5 Repro
 
 on:
   workflow_dispatch:
@@ -7,13 +7,13 @@ on:
       - issue773-repro
 
 jobs:
-  metal-gsm8k:
+  metal-gsm8k-n5:
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       # ============================================================
-      # 1. Checkout Cactus and pin reporter's engine commit
+      # 1. Checkout reporter's Cactus engine
       # ============================================================
 
       - name: Checkout
@@ -39,7 +39,6 @@ jobs:
           echo "===== ARCH ====="
           uname -a
           uname -m
-          arch
 
           echo
           echo "===== MACOS ====="
@@ -75,7 +74,7 @@ jobs:
           swift /tmp/metal_probe.swift
 
       # ============================================================
-      # 3. Build reporter's Cactus runtime
+      # 3. Build Cactus
       # ============================================================
 
       - name: Install dependencies
@@ -111,7 +110,7 @@ jobs:
           PY
 
       # ============================================================
-      # 4. Download tooling
+      # 4. Tooling + canonical GSM8K harness
       # ============================================================
 
       - name: Install Hugging Face CLI
@@ -119,10 +118,6 @@ jobs:
         run: |
           source venv/bin/activate
           python -m pip install -U huggingface_hub
-
-      # ============================================================
-      # 5. Fetch reporter's pinned GSM8K harness
-      # ============================================================
 
       - name: Fetch pinned GSM8K harness
         run: |
@@ -138,86 +133,14 @@ jobs:
           git rev-parse HEAD
 
           echo
-          echo "===== GSM8K DATA ====="
+          echo "===== GSM8K ====="
           ls -lh evaldata/gsm8k_test.jsonl
-
-          echo
-          echo "===== HARNESS ====="
           ls -lh scripts/parity_gsm8k.py
-
-      # ============================================================
-      # 6. BAD calibrated CQ4
-      # ============================================================
-
-      - name: Download BAD calibrated CQ4
-        shell: bash
-        run: |
-          source venv/bin/activate
-
-          mkdir -p "$RUNNER_TEMP/issue773"
-
-          hf download Cactus-Compute/gemma-4-E2B-it \
-            gemma-4-e2b-it-cq4.zip \
-            --local-dir "$RUNNER_TEMP/issue773"
-
-          echo
-          df -h
-
-      - name: Verify BAD hash
-        run: |
-          cd "$RUNNER_TEMP/issue773"
-
-          echo \
-          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
-          | shasum -a 256 -c -
-
-      - name: Extract BAD CQ4
-        run: |
-          mkdir -p "$RUNNER_TEMP/bad_cq4"
-
-          unzip -q \
-            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
-            -d "$RUNNER_TEMP/bad_cq4"
-
-          echo "===== BAD BUNDLE ====="
-          find "$RUNNER_TEMP/bad_cq4" -name config.txt
-
-          echo
-          du -sh "$RUNNER_TEMP/bad_cq4"
-          df -h
-
-      - name: Run BAD GSM8K n=10 on Metal
-        shell: bash
-        run: |
-          source venv/bin/activate
 
           mkdir -p "$RUNNER_TEMP/gsm8k_reports"
 
-          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
-          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
-            --which cactus \
-            --bundle "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
-            --cactus-repo "$GITHUB_WORKSPACE" \
-            --cactus-backend metal \
-            --n 10 \
-            --max-tokens 1024 \
-            --tag bad-cq4-old-engine-metal \
-            | tee bad_metal.txt
-
       # ============================================================
-      # 7. Delete BAD completely before downloading GOOD
-      # ============================================================
-
-      - name: Remove BAD CQ4
-        run: |
-          rm -rf "$RUNNER_TEMP/bad_cq4"
-          rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
-
-          echo "===== DISK AFTER BAD CLEANUP ====="
-          df -h
-
-      # ============================================================
-      # 8. GOOD previous uncalibrated CQ4
+      # 5. GOOD first — previous uncalibrated CQ4
       # ============================================================
 
       - name: Download GOOD uncalibrated CQ4
@@ -225,12 +148,11 @@ jobs:
         run: |
           source venv/bin/activate
 
+          mkdir -p "$RUNNER_TEMP/issue773"
+
           hf download Cactus-Compute/gemma-4-E2B-it \
             gemma-4-e2b-it-cq4-uncalibrated.zip \
             --local-dir "$RUNNER_TEMP/issue773"
-
-          echo
-          df -h
 
       - name: Verify GOOD hash
         run: |
@@ -252,10 +174,9 @@ jobs:
           find "$RUNNER_TEMP/good_cq4" -name config.txt
 
           echo
-          du -sh "$RUNNER_TEMP/good_cq4"
           df -h
 
-      - name: Run GOOD GSM8K n=10 on Metal
+      - name: Run GOOD GSM8K n=5 on Metal
         shell: bash
         run: |
           source venv/bin/activate
@@ -266,52 +187,118 @@ jobs:
             --bundle "$RUNNER_TEMP/good_cq4/gemma-4-e2b-it-cq4" \
             --cactus-repo "$GITHUB_WORKSPACE" \
             --cactus-backend metal \
-            --n 10 \
+            --n 5 \
             --max-tokens 1024 \
-            --tag good-cq4-old-engine-metal \
-            | tee good_metal.txt
+            --tag good-cq4-old-engine-metal-n5 \
+            | tee good_metal_n5.txt
 
       # ============================================================
-      # 9. Comparison
+      # 6. Delete GOOD to free disk
       # ============================================================
 
-      - name: Print Metal comparison
+      - name: Remove GOOD CQ4
+        run: |
+          rm -rf "$RUNNER_TEMP/good_cq4"
+          rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
+
+          echo "===== DISK AFTER GOOD ====="
+          df -h
+
+      # ============================================================
+      # 7. BAD calibrated CQ4
+      # ============================================================
+
+      - name: Download BAD calibrated CQ4
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify BAD hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | shasum -a 256 -c -
+
+      - name: Extract BAD CQ4
+        run: |
+          mkdir -p "$RUNNER_TEMP/bad_cq4"
+
+          unzip -q \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            -d "$RUNNER_TEMP/bad_cq4"
+
+          echo "===== BAD BUNDLE ====="
+          find "$RUNNER_TEMP/bad_cq4" -name config.txt
+
+          echo
+          df -h
+
+      - name: Run BAD GSM8K n=5 on Metal
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend metal \
+            --n 5 \
+            --max-tokens 1024 \
+            --tag bad-cq4-old-engine-metal-n5 \
+            | tee bad_metal_n5.txt
+
+      # ============================================================
+      # 8. Print comparison
+      # ============================================================
+
+      - name: Print Metal n5 comparison
         run: |
           echo
           echo "=========================================="
-          echo "BAD CQ4 — ENGINE 1ace6d78 — METAL"
+          echo "GOOD CQ4 — ENGINE 1ace6d78 — METAL — n=5"
           echo "=========================================="
-          cat bad_metal.txt
+          cat good_metal_n5.txt
 
           echo
           echo "=========================================="
-          echo "GOOD CQ4 — ENGINE 1ace6d78 — METAL"
+          echo "BAD CQ4 — ENGINE 1ace6d78 — METAL — n=5"
           echo "=========================================="
-          cat good_metal.txt
+          cat bad_metal_n5.txt
 
           echo
           echo "=========================================="
-          echo "AGGREGATE JSON"
+          echo "RESULT JSON"
           echo "=========================================="
-          cat "$RUNNER_TEMP/gsm8k_reports/gsm8k_bad-cq4-old-engine-metal.json"
+
+          cat "$RUNNER_TEMP/gsm8k_reports/gsm8k_good-cq4-old-engine-metal-n5.json"
+
           echo
-          cat "$RUNNER_TEMP/gsm8k_reports/gsm8k_good-cq4-old-engine-metal.json"
+
+          cat "$RUNNER_TEMP/gsm8k_reports/gsm8k_bad-cq4-old-engine-metal-n5.json"
 
       # ============================================================
-      # 10. Save logs/results
+      # 9. Upload results
       # ============================================================
 
-      - name: Collect result files
+      - name: Collect results
         run: |
           mkdir -p issue773_results
 
-          cp bad_metal.txt issue773_results/
-          cp good_metal.txt issue773_results/
+          cp good_metal_n5.txt issue773_results/
+          cp bad_metal_n5.txt issue773_results/
 
           cp "$RUNNER_TEMP/gsm8k_reports/"*.json issue773_results/
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: issue773-metal-n10-results
+          name: issue773-metal-n5-results
           path: issue773_results/
