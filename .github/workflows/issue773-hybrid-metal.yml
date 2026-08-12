@@ -15,7 +15,7 @@ jobs:
 
     steps:
       # ============================================================
-      # 1. Reporter engine
+      # 1. Checkout reporter's engine version
       # ============================================================
 
       - name: Checkout
@@ -33,19 +33,29 @@ jobs:
           git log -1 --oneline
 
       # ============================================================
-      # 2. Metal / build
+      # 2. Machine / Metal
       # ============================================================
 
       - name: Show machine info
         run: |
+          echo "===== MACHINE ====="
           uname -a
           uname -m
           sw_vers
+
+          echo
+          echo "===== HARDWARE ====="
           system_profiler SPHardwareDataType
+
+          echo
+          echo "===== GPU ====="
           system_profiler SPDisplaysDataType || true
+
+          echo
+          echo "===== DISK ====="
           df -h
 
-      - name: Verify Metal
+      - name: Verify Metal device
         run: |
           cat > /tmp/metal_probe.swift <<'SWIFT'
           import Foundation
@@ -62,6 +72,10 @@ jobs:
 
           swift /tmp/metal_probe.swift
 
+      # ============================================================
+      # 3. Build Cactus
+      # ============================================================
+
       - name: Install dependencies
         run: |
           brew install python@3.12 cmake
@@ -72,7 +86,10 @@ jobs:
           source ./setup
           cactus build --python
 
+          echo
+          echo "===== CACTUS LIBRARY ====="
           file cactus-engine/build/libcactus_engine.dylib
+          ls -lh cactus-engine/build/libcactus_engine.dylib
 
       - name: Verify Cactus Metal backend
         shell: bash
@@ -83,16 +100,17 @@ jobs:
           from cactus.bindings import cactus as C
 
           rc = C.cactus_set_backend("metal")
+
           print("cactus_set_backend('metal') =", rc)
 
           if rc != 0:
-              raise SystemExit("Metal backend rejected")
+              raise SystemExit("Cactus rejected Metal backend")
 
           print("CACTUS_METAL_BACKEND=AVAILABLE")
           PY
 
       # ============================================================
-      # 3. Tooling + reporter harness
+      # 4. Tooling + canonical GSM8K harness
       # ============================================================
 
       - name: Install Hugging Face CLI
@@ -117,17 +135,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gsm8k_reports"
 
       # ============================================================
-      # 4. Hybrid bundle helper
+      # 5. Hybrid bundle helper
       #
-      # It strips each ZIP's top-level directory.
+      # Commands:
       #
-      # Example:
-      #   bad.zip/foo/layer_0.weights
-      # becomes:
-      #   HYBRID/layer_0.weights
+      #   extract:
+      #     extract base bundle without its ZIP root directory
       #
-      # The helper also REFUSES to make a hybrid unless both bundles
-      # have exactly the same .weights paths and sizes.
+      #   overlay:
+      #     verify donor .weights layout matches base,
+      #     then replace all .weights with donor versions
       # ============================================================
 
       - name: Write hybrid bundle helper
@@ -136,25 +153,32 @@ jobs:
           import argparse
           import shutil
           import zipfile
+
           from pathlib import Path, PurePosixPath
+
+
+          COPY_CHUNK = 8 * 1024 * 1024
 
 
           def relative_path(name):
               parts = PurePosixPath(name).parts
 
+              # ZIP contains one top-level bundle directory.
               if len(parts) < 2:
                   return None
 
               rel = PurePosixPath(*parts[1:])
 
               if ".." in rel.parts:
-                  raise RuntimeError(f"unsafe zip path: {name}")
+                  raise RuntimeError(
+                      f"Unsafe ZIP path: {name}"
+                  )
 
               return rel
 
 
-          def weight_inventory(zip_path):
-              result = {}
+          def zip_weight_inventory(zip_path):
+              inventory = {}
 
               with zipfile.ZipFile(zip_path) as zf:
                   for info in zf.infolist():
@@ -166,66 +190,37 @@ jobs:
                       if rel is None:
                           continue
 
-                      rel_str = str(rel)
+                      rel_string = str(rel)
 
-                      if rel_str.endswith(".weights"):
-                          result[rel_str] = info.file_size
+                      if rel_string.endswith(".weights"):
+                          inventory[rel_string] = info.file_size
 
-              return result
-
-
-          def verify_weight_layout(base_zip, donor_zip):
-              base = weight_inventory(base_zip)
-              donor = weight_inventory(donor_zip)
-
-              print(f"Base weight files : {len(base)}")
-              print(f"Donor weight files: {len(donor)}")
-
-              only_base = sorted(set(base) - set(donor))
-              only_donor = sorted(set(donor) - set(base))
-
-              size_mismatch = sorted(
-                  p for p in set(base) & set(donor)
-                  if base[p] != donor[p]
-              )
-
-              if only_base:
-                  print("Weights only in base:")
-                  for p in only_base[:20]:
-                      print("  ", p)
-
-              if only_donor:
-                  print("Weights only in donor:")
-                  for p in only_donor[:20]:
-                      print("  ", p)
-
-              if size_mismatch:
-                  print("Weight size mismatches:")
-                  for p in size_mismatch[:20]:
-                      print(
-                          f"  {p}: "
-                          f"base={base[p]} donor={donor[p]}"
-                      )
-
-              if only_base or only_donor or size_mismatch:
-                  raise RuntimeError(
-                      "Weight layouts are not interchangeable; "
-                      "refusing to create hybrid"
-                  )
-
-              print(
-                  "WEIGHT_LAYOUT_COMPATIBLE=YES "
-                  f"({len(base)} files)"
-              )
+              return inventory
 
 
-          def extract_base(zip_path, output):
+          def directory_weight_inventory(directory):
+              directory = Path(directory)
+
+              inventory = {}
+
+              for path in directory.rglob("*.weights"):
+                  rel = str(path.relative_to(directory))
+
+                  inventory[rel] = path.stat().st_size
+
+              return inventory
+
+
+          def extract_bundle(zip_path, output):
               output = Path(output)
 
               if output.exists():
                   shutil.rmtree(output)
 
-              output.mkdir(parents=True)
+              output.mkdir(
+                  parents=True,
+                  exist_ok=True,
+              )
 
               count = 0
 
@@ -240,26 +235,104 @@ jobs:
                           continue
 
                       target = output / Path(*rel.parts)
+
                       target.parent.mkdir(
                           parents=True,
                           exist_ok=True,
                       )
 
-                      with zf.open(info) as src, \
-                           target.open("wb") as dst:
-                          shutil.copyfileobj(
-                              src,
-                              dst,
-                              length=8 * 1024 * 1024,
-                          )
+                      with zf.open(info) as src:
+                          with target.open("wb") as dst:
+                              shutil.copyfileobj(
+                                  src,
+                                  dst,
+                                  length=COPY_CHUNK,
+                              )
 
                       count += 1
 
-              print(f"Extracted {count} base files")
+              print(
+                  f"EXTRACTED_FILES={count}"
+              )
+
+              print(
+                  f"BUNDLE_READY={output}"
+              )
+
+
+          def verify_weight_layout(donor_zip, base_directory):
+              donor = zip_weight_inventory(donor_zip)
+
+              base = directory_weight_inventory(
+                  base_directory
+              )
+
+              print(
+                  f"BASE_WEIGHT_FILES={len(base)}"
+              )
+
+              print(
+                  f"DONOR_WEIGHT_FILES={len(donor)}"
+              )
+
+              only_base = sorted(
+                  set(base) - set(donor)
+              )
+
+              only_donor = sorted(
+                  set(donor) - set(base)
+              )
+
+              size_mismatch = sorted(
+                  path
+                  for path in set(base) & set(donor)
+                  if base[path] != donor[path]
+              )
+
+              if only_base:
+                  print("===== WEIGHTS ONLY IN BASE =====")
+
+                  for path in only_base[:20]:
+                      print(path)
+
+              if only_donor:
+                  print("===== WEIGHTS ONLY IN DONOR =====")
+
+                  for path in only_donor[:20]:
+                      print(path)
+
+              if size_mismatch:
+                  print("===== WEIGHT SIZE MISMATCHES =====")
+
+                  for path in size_mismatch[:20]:
+                      print(
+                          f"{path}: "
+                          f"base={base[path]} "
+                          f"donor={donor[path]}"
+                      )
+
+              if (
+                  only_base
+                  or only_donor
+                  or size_mismatch
+              ):
+                  raise RuntimeError(
+                      "Weight layouts are not interchangeable"
+                  )
+
+              print(
+                  "WEIGHT_LAYOUT_COMPATIBLE=YES"
+              )
 
 
           def overlay_weights(donor_zip, output):
+              verify_weight_layout(
+                  donor_zip,
+                  output,
+              )
+
               output = Path(output)
+
               count = 0
 
               with zipfile.ZipFile(donor_zip) as zf:
@@ -272,61 +345,95 @@ jobs:
                       if rel is None:
                           continue
 
-                      if not str(rel).endswith(".weights"):
+                      rel_string = str(rel)
+
+                      if not rel_string.endswith(
+                          ".weights"
+                      ):
                           continue
 
-                      target = output / Path(*rel.parts)
+                      target = (
+                          output
+                          / Path(*rel.parts)
+                      )
 
                       if not target.exists():
                           raise RuntimeError(
-                              f"base missing donor weight: {rel}"
+                              f"Missing base weight: {rel}"
                           )
 
-                      if target.stat().st_size != info.file_size:
+                      if (
+                          target.stat().st_size
+                          != info.file_size
+                      ):
                           raise RuntimeError(
-                              f"size mismatch for {rel}: "
-                              f"base={target.stat().st_size}, "
-                              f"donor={info.file_size}"
+                              f"Size mismatch: {rel}"
                           )
 
-                      with zf.open(info) as src, \
-                           target.open("wb") as dst:
-                          shutil.copyfileobj(
-                              src,
-                              dst,
-                              length=8 * 1024 * 1024,
-                          )
+                      with zf.open(info) as src:
+                          with target.open("wb") as dst:
+                              shutil.copyfileobj(
+                                  src,
+                                  dst,
+                                  length=COPY_CHUNK,
+                              )
 
                       count += 1
 
-              print(f"Overlaid {count} donor weight files")
+              print(
+                  f"OVERLAID_WEIGHT_FILES={count}"
+              )
 
 
           def main():
-              ap = argparse.ArgumentParser()
+              parser = argparse.ArgumentParser()
 
-              ap.add_argument("--base", required=True)
-              ap.add_argument("--donor", required=True)
-              ap.add_argument("--output", required=True)
-
-              args = ap.parse_args()
-
-              verify_weight_layout(
-                  args.base,
-                  args.donor,
+              commands = parser.add_subparsers(
+                  dest="command",
+                  required=True,
               )
 
-              extract_base(
-                  args.base,
-                  args.output,
+              extract = commands.add_parser(
+                  "extract"
               )
 
-              overlay_weights(
-                  args.donor,
-                  args.output,
+              extract.add_argument(
+                  "--zip",
+                  required=True,
               )
 
-              print(f"HYBRID_READY={args.output}")
+              extract.add_argument(
+                  "--output",
+                  required=True,
+              )
+
+              overlay = commands.add_parser(
+                  "overlay"
+              )
+
+              overlay.add_argument(
+                  "--donor",
+                  required=True,
+              )
+
+              overlay.add_argument(
+                  "--output",
+                  required=True,
+              )
+
+              args = parser.parse_args()
+
+              if args.command == "extract":
+                  extract_bundle(
+                      args.zip,
+                      args.output,
+                  )
+
+              elif args.command == "overlay":
+                  overlay_weights(
+                      args.donor,
+                      args.output,
+                  )
 
 
           if __name__ == "__main__":
@@ -334,10 +441,13 @@ jobs:
           PY
 
       # ============================================================
-      # 5. HYBRID A
+      # 6. HYBRID A
       #
-      # BAD shell / graphs / configs
+      # BAD shell / graphs / config
       # GOOD weights
+      #
+      # Question:
+      # Does replacing BAD weights with GOOD weights fix Q1?
       # ============================================================
 
       - name: Download BAD base for Hybrid A
@@ -351,6 +461,8 @@ jobs:
             gemma-4-e2b-it-cq4.zip \
             --local-dir "$RUNNER_TEMP/issue773"
 
+      - name: Verify BAD base hash
+        run: |
           cd "$RUNNER_TEMP/issue773"
 
           echo \
@@ -359,23 +471,18 @@ jobs:
 
       - name: Extract BAD shell for Hybrid A
         run: |
-          python - <<'PY'
-          import sys
-          sys.path.insert(0, "/tmp")
-          import make_hybrid
-
-          make_hybrid.extract_base(
-              "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip",
-              "$RUNNER_TEMP/hybrid_bad_shell_good_weights",
-          )
-          PY
+          python /tmp/make_hybrid.py extract \
+            --zip "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            --output "$RUNNER_TEMP/hybrid_bad_shell_good_weights"
 
           rm -f \
             "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
 
+          echo
+          echo "===== DISK AFTER BAD EXTRACTION ====="
           df -h
 
-      - name: Download GOOD donor weights for Hybrid A
+      - name: Download GOOD weights for Hybrid A
         shell: bash
         run: |
           source venv/bin/activate
@@ -384,6 +491,8 @@ jobs:
             gemma-4-e2b-it-cq4-uncalibrated.zip \
             --local-dir "$RUNNER_TEMP/issue773"
 
+      - name: Verify GOOD donor hash
+        run: |
           cd "$RUNNER_TEMP/issue773"
 
           echo \
@@ -392,86 +501,15 @@ jobs:
 
       - name: Overlay GOOD weights onto BAD shell
         run: |
-          python - <<'PY'
-          import sys
-          sys.path.insert(0, "/tmp")
-          import make_hybrid
-
-          base_zip = \
-              "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
-
-          hybrid = \
-              "$RUNNER_TEMP/hybrid_bad_shell_good_weights"
-
-          donor_inventory = make_hybrid.weight_inventory(
-              base_zip
-          )
-
-          current_inventory = {}
-
-          from pathlib import Path
-
-          for p in Path(hybrid).rglob("*.weights"):
-              current_inventory[
-                  str(p.relative_to(hybrid))
-              ] = p.stat().st_size
-
-          only_hybrid = (
-              set(current_inventory)
-              - set(donor_inventory)
-          )
-
-          only_donor = (
-              set(donor_inventory)
-              - set(current_inventory)
-          )
-
-          mismatched = {
-              p for p in (
-                  set(current_inventory)
-                  & set(donor_inventory)
-              )
-              if current_inventory[p]
-              != donor_inventory[p]
-          }
-
-          print(
-              "Hybrid shell weights:",
-              len(current_inventory),
-          )
-          print(
-              "GOOD donor weights:",
-              len(donor_inventory),
-          )
-
-          if only_hybrid or only_donor or mismatched:
-              print(
-                  "only_hybrid =",
-                  sorted(only_hybrid)[:20],
-              )
-              print(
-                  "only_donor =",
-                  sorted(only_donor)[:20],
-              )
-              print(
-                  "size_mismatch =",
-                  sorted(mismatched)[:20],
-              )
-              raise SystemExit(
-                  "Weight layouts incompatible"
-              )
-
-          print("WEIGHT_LAYOUT_COMPATIBLE=YES")
-
-          make_hybrid.overlay_weights(
-              base_zip,
-              hybrid,
-          )
-          PY
+          python /tmp/make_hybrid.py overlay \
+            --donor "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
+            --output "$RUNNER_TEMP/hybrid_bad_shell_good_weights"
 
           rm -f \
             "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
 
+          echo
+          echo "===== DISK BEFORE HYBRID A RUN ====="
           df -h
 
       - name: Run Hybrid A GSM8K Q1 on Metal
@@ -496,13 +534,18 @@ jobs:
           rm -rf \
             "$RUNNER_TEMP/hybrid_bad_shell_good_weights"
 
+          echo
+          echo "===== DISK AFTER HYBRID A ====="
           df -h
 
       # ============================================================
-      # 6. HYBRID B
+      # 7. HYBRID B
       #
-      # GOOD shell / graphs / configs
+      # GOOD shell / graphs / config
       # BAD weights
+      #
+      # Question:
+      # Do BAD weights make the GOOD shell fail?
       # ============================================================
 
       - name: Download GOOD base for Hybrid B
@@ -514,6 +557,8 @@ jobs:
             gemma-4-e2b-it-cq4-uncalibrated.zip \
             --local-dir "$RUNNER_TEMP/issue773"
 
+      - name: Verify GOOD base hash
+        run: |
           cd "$RUNNER_TEMP/issue773"
 
           echo \
@@ -522,23 +567,18 @@ jobs:
 
       - name: Extract GOOD shell for Hybrid B
         run: |
-          python - <<'PY'
-          import sys
-          sys.path.insert(0, "/tmp")
-          import make_hybrid
-
-          make_hybrid.extract_base(
-              "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip",
-              "$RUNNER_TEMP/hybrid_good_shell_bad_weights",
-          )
-          PY
+          python /tmp/make_hybrid.py extract \
+            --zip "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
+            --output "$RUNNER_TEMP/hybrid_good_shell_bad_weights"
 
           rm -f \
             "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
 
+          echo
+          echo "===== DISK AFTER GOOD EXTRACTION ====="
           df -h
 
-      - name: Download BAD donor weights for Hybrid B
+      - name: Download BAD weights for Hybrid B
         shell: bash
         run: |
           source venv/bin/activate
@@ -547,6 +587,8 @@ jobs:
             gemma-4-e2b-it-cq4.zip \
             --local-dir "$RUNNER_TEMP/issue773"
 
+      - name: Verify BAD donor hash
+        run: |
           cd "$RUNNER_TEMP/issue773"
 
           echo \
@@ -555,86 +597,15 @@ jobs:
 
       - name: Overlay BAD weights onto GOOD shell
         run: |
-          python - <<'PY'
-          import sys
-          sys.path.insert(0, "/tmp")
-          import make_hybrid
-
-          donor_zip = \
-              "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
-
-          hybrid = \
-              "$RUNNER_TEMP/hybrid_good_shell_bad_weights"
-
-          donor_inventory = make_hybrid.weight_inventory(
-              donor_zip
-          )
-
-          current_inventory = {}
-
-          from pathlib import Path
-
-          for p in Path(hybrid).rglob("*.weights"):
-              current_inventory[
-                  str(p.relative_to(hybrid))
-              ] = p.stat().st_size
-
-          only_hybrid = (
-              set(current_inventory)
-              - set(donor_inventory)
-          )
-
-          only_donor = (
-              set(donor_inventory)
-              - set(current_inventory)
-          )
-
-          mismatched = {
-              p for p in (
-                  set(current_inventory)
-                  & set(donor_inventory)
-              )
-              if current_inventory[p]
-              != donor_inventory[p]
-          }
-
-          print(
-              "Hybrid shell weights:",
-              len(current_inventory),
-          )
-          print(
-              "BAD donor weights:",
-              len(donor_inventory),
-          )
-
-          if only_hybrid or only_donor or mismatched:
-              print(
-                  "only_hybrid =",
-                  sorted(only_hybrid)[:20],
-              )
-              print(
-                  "only_donor =",
-                  sorted(only_donor)[:20],
-              )
-              print(
-                  "size_mismatch =",
-                  sorted(mismatched)[:20],
-              )
-              raise SystemExit(
-                  "Weight layouts incompatible"
-              )
-
-          print("WEIGHT_LAYOUT_COMPATIBLE=YES")
-
-          make_hybrid.overlay_weights(
-              donor_zip,
-              hybrid,
-          )
-          PY
+          python /tmp/make_hybrid.py overlay \
+            --donor "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            --output "$RUNNER_TEMP/hybrid_good_shell_bad_weights"
 
           rm -f \
             "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
 
+          echo
+          echo "===== DISK BEFORE HYBRID B RUN ====="
           df -h
 
       - name: Run Hybrid B GSM8K Q1 on Metal
@@ -655,20 +626,22 @@ jobs:
             | tee hybrid_b.txt
 
       # ============================================================
-      # 7. Compare
+      # 8. Print diagnostic comparison
       # ============================================================
 
       - name: Print hybrid comparison
         run: |
           echo
           echo "=========================================="
-          echo "HYBRID A: BAD SHELL + GOOD WEIGHTS"
+          echo "HYBRID A"
+          echo "BAD SHELL + GOOD WEIGHTS"
           echo "=========================================="
           cat hybrid_a.txt
 
           echo
           echo "=========================================="
-          echo "HYBRID B: GOOD SHELL + BAD WEIGHTS"
+          echo "HYBRID B"
+          echo "GOOD SHELL + BAD WEIGHTS"
           echo "=========================================="
           cat hybrid_b.txt
 
@@ -684,6 +657,10 @@ jobs:
 
           cat \
             "$RUNNER_TEMP/gsm8k_reports/gsm8k_hybrid-good-shell-bad-weights.json"
+
+      # ============================================================
+      # 9. Save results
+      # ============================================================
 
       - name: Collect results
         run: |
