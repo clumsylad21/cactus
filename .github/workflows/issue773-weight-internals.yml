@@ -1,0 +1,763 @@
+name: Issue 773 CQ4 Weight Internals
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - issue773-repro
+    paths:
+      - ".github/workflows/issue773-weight-internals.yml"
+
+jobs:
+  inspect-weights:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Hugging Face CLI
+        run: |
+          python -m pip install -U huggingface_hub numpy
+
+      # ============================================================
+      # Inspector
+      # ============================================================
+
+      - name: Write CQ weight inspector
+        run: |
+          cat > /tmp/inspect_cq.py <<'PY'
+          import argparse
+          import hashlib
+          import json
+          import struct
+          import zipfile
+
+          from pathlib import PurePosixPath
+
+          import numpy as np
+
+
+          HEADER_SIZE = 84
+          HEADER_ALIGNED = 96
+
+          PRECISION_BITS = {
+              3: 1,
+              4: 2,
+              5: 3,
+              6: 4,
+          }
+
+          FLAG_ORTHOGONAL = 1 << 1
+          FLAG_INTERLEAVED = 1 << 2
+
+
+          def normalized_path(name):
+              parts = PurePosixPath(name).parts
+
+              if len(parts) < 2:
+                  return None
+
+              return str(
+                  PurePosixPath(*parts[1:])
+              )
+
+
+          def sha256_bytes(data):
+              return hashlib.sha256(data).hexdigest()
+
+
+          def fp16_stats(blob):
+              if not blob:
+                  return None
+
+              arr = np.frombuffer(
+                  blob,
+                  dtype="<f2",
+              ).astype(np.float32)
+
+              if arr.size == 0:
+                  return None
+
+              finite = np.isfinite(arr)
+
+              result = {
+                  "count": int(arr.size),
+                  "finite": int(finite.sum()),
+                  "nan": int(np.isnan(arr).sum()),
+                  "inf": int(np.isinf(arr).sum()),
+              }
+
+              if finite.any():
+                  vals = arr[finite]
+
+                  result.update({
+                      "min": float(vals.min()),
+                      "max": float(vals.max()),
+                      "mean": float(vals.mean()),
+                      "abs_mean": float(
+                          np.abs(vals).mean()
+                      ),
+                      "zeros": int(
+                          np.count_nonzero(vals == 0)
+                      ),
+                  })
+
+              return result
+
+
+          def parse_header(blob):
+              if len(blob) < HEADER_SIZE:
+                  return None
+
+              if blob[:4] != b"CACT":
+                  return None
+
+              flags = struct.unpack_from(
+                  "<I",
+                  blob,
+                  4,
+              )[0]
+
+              alignment = struct.unpack_from(
+                  "<I",
+                  blob,
+                  8,
+              )[0]
+
+              ndim = struct.unpack_from(
+                  "<I",
+                  blob,
+                  12,
+              )[0]
+
+              dims = list(
+                  struct.unpack_from(
+                      "<QQQQ",
+                      blob,
+                      16,
+                  )
+              )
+
+              precision = struct.unpack_from(
+                  "<I",
+                  blob,
+                  48,
+              )[0]
+
+              data_bytes = struct.unpack_from(
+                  "<Q",
+                  blob,
+                  52,
+              )[0]
+
+              scales_bytes = struct.unpack_from(
+                  "<Q",
+                  blob,
+                  60,
+              )[0]
+
+              group_size = struct.unpack_from(
+                  "<I",
+                  blob,
+                  68,
+              )[0]
+
+              groups = struct.unpack_from(
+                  "<I",
+                  blob,
+                  72,
+              )[0]
+
+              original_n = struct.unpack_from(
+                  "<Q",
+                  blob,
+                  76,
+              )[0]
+
+              return {
+                  "flags": flags,
+                  "alignment": alignment,
+                  "ndim": ndim,
+                  "dims": dims,
+                  "precision": precision,
+                  "data_bytes": data_bytes,
+                  "scales_bytes": scales_bytes,
+                  "group_size": group_size,
+                  "groups": groups,
+                  "original_n": original_n,
+              }
+
+
+          def inspect_cq_member(zf, info):
+              with zf.open(info) as f:
+                  blob = f.read()
+
+              header = parse_header(blob)
+
+              if header is None:
+                  return {
+                      "valid_header": False,
+                      "file_size": len(blob),
+                  }
+
+              precision = header["precision"]
+
+              if precision not in PRECISION_BITS:
+                  return {
+                      "valid_header": True,
+                      "is_cq": False,
+                      "file_size": len(blob),
+                      "header": header,
+                  }
+
+              bits = PRECISION_BITS[precision]
+
+              n = int(header["dims"][0])
+              k = int(header["dims"][1])
+
+              group_size = int(
+                  header["group_size"]
+              )
+
+              groups = int(
+                  header["groups"]
+              )
+
+              flags = int(header["flags"])
+
+              scales_start = HEADER_ALIGNED
+
+              scales_end = (
+                  scales_start
+                  + int(header["scales_bytes"])
+              )
+
+              data_start = (
+                  (
+                      scales_end + 31
+                  )
+                  // 32
+              ) * 32
+
+              data_end = (
+                  data_start
+                  + int(header["data_bytes"])
+              )
+
+              if data_end > len(blob):
+                  raise RuntimeError(
+                      "Declared tensor sections exceed "
+                      f"file size: {info.filename}"
+                  )
+
+              scales_blob = blob[
+                  scales_start:scales_end
+              ]
+
+              data_blob = blob[
+                  data_start:data_end
+              ]
+
+              # --------------------------------------------
+              # CQ scales blob structure:
+              #
+              # codebook       = 2^bits FP16
+              # input_scale    = K FP16
+              # reciprocal     = K FP16
+              # norms          = N * groups FP16
+              # rotation       = remaining bytes
+              # --------------------------------------------
+
+              offset = 0
+
+              codebook_bytes = (
+                  (1 << bits) * 2
+              )
+
+              input_scale_bytes = k * 2
+              reciprocal_bytes = k * 2
+              norms_bytes = n * groups * 2
+
+              codebook = scales_blob[
+                  offset:
+                  offset + codebook_bytes
+              ]
+
+              offset += codebook_bytes
+
+              input_scale = scales_blob[
+                  offset:
+                  offset + input_scale_bytes
+              ]
+
+              offset += input_scale_bytes
+
+              reciprocal = scales_blob[
+                  offset:
+                  offset + reciprocal_bytes
+              ]
+
+              offset += reciprocal_bytes
+
+              norms = scales_blob[
+                  offset:
+                  offset + norms_bytes
+              ]
+
+              offset += norms_bytes
+
+              rotation = scales_blob[offset:]
+
+              return {
+                  "valid_header": True,
+                  "is_cq": True,
+                  "file_size": len(blob),
+                  "bits": bits,
+                  "header": header,
+
+                  "orthogonal": bool(
+                      flags & FLAG_ORTHOGONAL
+                  ),
+
+                  "interleaved": bool(
+                      flags & FLAG_INTERLEAVED
+                  ),
+
+                  "section_sha256": {
+                      "codebook":
+                          sha256_bytes(codebook),
+
+                      "input_scale":
+                          sha256_bytes(input_scale),
+
+                      "reciprocal":
+                          sha256_bytes(reciprocal),
+
+                      "norms":
+                          sha256_bytes(norms),
+
+                      "rotation":
+                          sha256_bytes(rotation),
+
+                      "packed_indices":
+                          sha256_bytes(data_blob),
+                  },
+
+                  "stats": {
+                      "codebook":
+                          fp16_stats(codebook),
+
+                      "input_scale":
+                          fp16_stats(input_scale),
+
+                      "reciprocal":
+                          fp16_stats(reciprocal),
+
+                      "norms":
+                          fp16_stats(norms),
+                  },
+              }
+
+
+          def inspect_zip(zip_path, output):
+              result = {}
+
+              with zipfile.ZipFile(
+                  zip_path
+              ) as zf:
+
+                  members = [
+                      x
+                      for x in zf.infolist()
+                      if (
+                          not x.is_dir()
+                          and x.filename.endswith(
+                              ".weights"
+                          )
+                      )
+                  ]
+
+                  for i, info in enumerate(
+                      members,
+                      1,
+                  ):
+                      path = normalized_path(
+                          info.filename
+                      )
+
+                      if path is None:
+                          continue
+
+                      # Focus investigation on language model
+                      # tensors first.
+                      relevant = (
+                          path.startswith("layer_")
+                          or path.startswith(
+                              "embed_tokens"
+                          )
+                          or path.startswith(
+                              "output"
+                          )
+                      )
+
+                      if not relevant:
+                          continue
+
+                      record = inspect_cq_member(
+                          zf,
+                          info,
+                      )
+
+                      result[path] = record
+
+                      if (
+                          len(result) % 25 == 0
+                      ):
+                          print(
+                              "inspected",
+                              len(result),
+                              "relevant weights",
+                          )
+
+              with open(
+                  output,
+                  "w",
+              ) as f:
+                  json.dump(
+                      result,
+                      f,
+                      indent=2,
+                  )
+
+              print(
+                  "TOTAL_RELEVANT_WEIGHTS=",
+                  len(result),
+              )
+
+
+          if __name__ == "__main__":
+              ap = argparse.ArgumentParser()
+
+              ap.add_argument(
+                  "--zip",
+                  required=True,
+              )
+
+              ap.add_argument(
+                  "--output",
+                  required=True,
+              )
+
+              args = ap.parse_args()
+
+              inspect_zip(
+                  args.zip,
+                  args.output,
+              )
+          PY
+
+      # ============================================================
+      # BAD
+      # ============================================================
+
+      - name: Download BAD calibrated CQ4
+        run: |
+          mkdir -p "$RUNNER_TEMP/issue773"
+          mkdir -p issue773_weight_internals
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify BAD hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | sha256sum -c -
+
+      - name: Inspect BAD weights
+        run: |
+          python /tmp/inspect_cq.py \
+            --zip "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            --output issue773_weight_internals/bad.json
+
+      - name: Remove BAD
+        run: |
+          rm -f \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
+
+          df -h
+
+      # ============================================================
+      # GOOD
+      # ============================================================
+
+      - name: Download GOOD uncalibrated CQ4
+        run: |
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4-uncalibrated.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify GOOD hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
+          | sha256sum -c -
+
+      - name: Inspect GOOD weights
+        run: |
+          python /tmp/inspect_cq.py \
+            --zip "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
+            --output issue773_weight_internals/good.json
+
+      - name: Remove GOOD
+        run: |
+          rm -f \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
+
+      # ============================================================
+      # Compare internal CQ sections
+      # ============================================================
+
+      - name: Compare CQ internals
+        run: |
+          cat > /tmp/compare_cq.py <<'PY'
+          import json
+          from collections import Counter
+
+
+          with open(
+              "issue773_weight_internals/bad.json"
+          ) as f:
+              bad = json.load(f)
+
+          with open(
+              "issue773_weight_internals/good.json"
+          ) as f:
+              good = json.load(f)
+
+
+          common = sorted(
+              set(bad) & set(good)
+          )
+
+          sections = [
+              "codebook",
+              "input_scale",
+              "reciprocal",
+              "norms",
+              "rotation",
+              "packed_indices",
+          ]
+
+
+          same_header = 0
+          different_header = []
+
+          section_changes = Counter()
+
+          cq_common = []
+
+
+          for path in common:
+              b = bad[path]
+              g = good[path]
+
+              if not (
+                  b.get("is_cq")
+                  and g.get("is_cq")
+              ):
+                  continue
+
+              cq_common.append(path)
+
+              if b["header"] == g["header"]:
+                  same_header += 1
+              else:
+                  different_header.append(
+                      path
+                  )
+
+              for section in sections:
+                  if (
+                      b["section_sha256"][
+                          section
+                      ]
+                      !=
+                      g["section_sha256"][
+                          section
+                      ]
+                  ):
+                      section_changes[
+                          section
+                      ] += 1
+
+
+          print(
+              "=========================================="
+          )
+          print(
+              "ISSUE 773 CQ4 INTERNAL WEIGHT DIFF"
+          )
+          print(
+              "=========================================="
+          )
+
+          print(
+              f"Common relevant weights: {len(common)}"
+          )
+
+          print(
+              f"Common CQ weights:       {len(cq_common)}"
+          )
+
+          print(
+              f"Identical CQ headers:    {same_header}"
+          )
+
+          print(
+              f"Different CQ headers:    "
+              f"{len(different_header)}"
+          )
+
+          print()
+
+          print(
+              "===== CHANGED CQ SECTIONS ====="
+          )
+
+          for section in sections:
+              print(
+                  f"{section:16s}: "
+                  f"{section_changes[section]}"
+              )
+
+          print()
+
+          if different_header:
+              print(
+                  "===== FIRST HEADER DIFFERENCES ====="
+              )
+
+              for path in different_header[:10]:
+                  print()
+                  print(path)
+
+                  print(
+                      "  BAD :",
+                      bad[path]["header"],
+                  )
+
+                  print(
+                      "  GOOD:",
+                      good[path]["header"],
+                  )
+
+
+          print()
+          print(
+              "===== FIRST 15 CHANGED CQ WEIGHTS ====="
+          )
+
+          shown = 0
+
+          for path in cq_common:
+              changed = [
+                  section
+                  for section in sections
+                  if (
+                      bad[path][
+                          "section_sha256"
+                      ][section]
+                      !=
+                      good[path][
+                          "section_sha256"
+                      ][section]
+                  )
+              ]
+
+              if not changed:
+                  continue
+
+              print()
+              print(path)
+
+              print(
+                  "  changed:",
+                  ", ".join(changed),
+              )
+
+              print(
+                  "  bits:",
+                  bad[path]["bits"],
+              )
+
+              print(
+                  "  flags:",
+                  bad[path]["header"]["flags"],
+              )
+
+              print(
+                  "  group_size:",
+                  bad[path]["header"][
+                      "group_size"
+                  ],
+              )
+
+              print(
+                  "  BAD input_scale stats:",
+                  bad[path]["stats"][
+                      "input_scale"
+                  ],
+              )
+
+              print(
+                  "  GOOD input_scale stats:",
+                  good[path]["stats"][
+                      "input_scale"
+                  ],
+              )
+
+              print(
+                  "  BAD norms stats:",
+                  bad[path]["stats"][
+                      "norms"
+                  ],
+              )
+
+              print(
+                  "  GOOD norms stats:",
+                  good[path]["stats"][
+                      "norms"
+                  ],
+              )
+
+              shown += 1
+
+              if shown >= 15:
+                  break
+          PY
+
+          python /tmp/compare_cq.py \
+            | tee issue773_weight_internals/summary.txt
+
+      - name: Print CQ internal summary
+        run: |
+          cat issue773_weight_internals/summary.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue773-cq4-weight-internals
+          path: issue773_weight_internals/
