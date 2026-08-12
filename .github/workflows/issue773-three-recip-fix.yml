@@ -1,0 +1,670 @@
+name: Issue 773 Three-Recip Metal Fix Probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - issue773-repro
+    paths:
+      - ".github/workflows/issue773-three-recip-fix.yml"
+
+jobs:
+  three-recip-fix:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      # ============================================================
+      # 1. Exact baseline commit
+      #
+      # IMPORTANT:
+      # We intentionally pin the same current-main commit where
+      # BAD Q1 produced:
+      #
+      #   pred=16, gold=18
+      #
+      # This keeps the experiment controlled.
+      # ============================================================
+
+      - name: Checkout exact current Cactus baseline
+        uses: actions/checkout@v4
+        with:
+          repository: cactus-compute/cactus
+          ref: c90a1afa4704574cef91ebfe29146902a0ab5209
+
+      - name: Show baseline
+        run: |
+          echo "=========================================="
+          echo "BASELINE CACTUS COMMIT"
+          echo "=========================================="
+
+          git rev-parse HEAD
+          git log -1 --oneline
+
+          test "$(git rev-parse HEAD)" = \
+            "c90a1afa4704574cef91ebfe29146902a0ab5209"
+
+      # ============================================================
+      # 2. Environment
+      # ============================================================
+
+      - name: Show machine
+        run: |
+          uname -a
+          uname -m
+          sw_vers
+
+          echo
+          system_profiler SPHardwareDataType
+
+          echo
+          system_profiler SPDisplaysDataType || true
+
+      - name: Verify Metal device
+        run: |
+          cat > /tmp/metal_probe.swift <<'SWIFT'
+          import Foundation
+          import Metal
+
+          if let device = MTLCreateSystemDefaultDevice() {
+              print("METAL_AVAILABLE=YES")
+              print("METAL_DEVICE=\(device.name)")
+          } else {
+              print("METAL_AVAILABLE=NO")
+              exit(1)
+          }
+          SWIFT
+
+          swift /tmp/metal_probe.swift
+
+      - name: Install dependencies
+        run: |
+          brew install python@3.12 cmake
+
+      # ============================================================
+      # 3. Apply ONLY the hypothesis patch
+      #
+      # Before:
+      #
+      #   cq4_transform_batch receives ONE recip pointer.
+      #
+      # After:
+      #
+      #   recip0
+      #   recip1
+      #   recip2
+      #
+      # and selects recip according to batch index b,
+      # just like lsign / rsign / perm already do.
+      # ============================================================
+
+      - name: Apply three-recip patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+
+          # ========================================================
+          # Patch Metal kernel
+          # ========================================================
+
+          metal_path = Path(
+              "cactus-kernels/src/cactus_kernels.metal"
+          )
+
+          metal = metal_path.read_text()
+
+          start_marker = "kernel void cq4_transform_batch("
+          end_marker = "#define CQ4_VPL 16u"
+
+          start = metal.index(start_marker)
+          end = metal.index(end_marker, start)
+
+          new_kernel = r'''kernel void cq4_transform_batch(
+              device const half*  x       [[buffer(0)]],
+
+              device const half*  recip0  [[buffer(1)]],
+              device const half*  recip1  [[buffer(2)]],
+              device const half*  recip2  [[buffer(3)]],
+
+              device const char*  lsign0  [[buffer(4)]],
+              device const char*  lsign1  [[buffer(5)]],
+              device const char*  lsign2  [[buffer(6)]],
+
+              device const char*  rsign0  [[buffer(7)]],
+              device const char*  rsign1  [[buffer(8)]],
+              device const char*  rsign2  [[buffer(9)]],
+
+              device const uint*  perm0   [[buffer(10)]],
+              device const uint*  perm1   [[buffer(11)]],
+              device const uint*  perm2   [[buffer(12)]],
+
+              device       half*  code0   [[buffer(13)]],
+              device       half*  code1   [[buffer(14)]],
+              device       half*  code2   [[buffer(15)]],
+
+              constant uint& ng           [[buffer(16)]],
+
+              uint tgpos [[threadgroup_position_in_grid]],
+              uint lane  [[thread_index_in_simdgroup]],
+
+              threadgroup float* zmem [[threadgroup(0)]])
+          {
+              uint g = tgpos % ng;
+              uint b = tgpos / ng;
+
+              device const half* recip =
+                  (b == 0u)
+                      ? recip0
+                      : ((b == 1u) ? recip1 : recip2);
+
+              device const char* lsign =
+                  (b == 0u)
+                      ? lsign0
+                      : ((b == 1u) ? lsign1 : lsign2);
+
+              device const char* rsign =
+                  (b == 0u)
+                      ? rsign0
+                      : ((b == 1u) ? rsign1 : rsign2);
+
+              device const uint* perm =
+                  (b == 0u)
+                      ? perm0
+                      : ((b == 1u) ? perm1 : perm2);
+
+              device half* code =
+                  (b == 0u)
+                      ? code0
+                      : ((b == 1u) ? code1 : code2);
+
+              uint base = g * 128u + lane * 4u;
+              uint k = lane * 4u;
+
+              float x0 =
+                  (float)x[base + 0]
+                  * (float)recip[base + 0]
+                  * (float)lsign[k + 0];
+
+              float x1 =
+                  (float)x[base + 1]
+                  * (float)recip[base + 1]
+                  * (float)lsign[k + 1];
+
+              float x2 =
+                  (float)x[base + 2]
+                  * (float)recip[base + 2]
+                  * (float)lsign[k + 2];
+
+              float x3 =
+                  (float)x[base + 3]
+                  * (float)recip[base + 3]
+                  * (float)lsign[k + 3];
+
+              cq4_hada128(
+                  x0,
+                  x1,
+                  x2,
+                  x3,
+                  lane
+              );
+
+              zmem[k + 0] =
+                  x0 * (float)rsign[k + 0];
+
+              zmem[k + 1] =
+                  x1 * (float)rsign[k + 1];
+
+              zmem[k + 2] =
+                  x2 * (float)rsign[k + 2];
+
+              zmem[k + 3] =
+                  x3 * (float)rsign[k + 3];
+
+              threadgroup_barrier(
+                  mem_flags::mem_threadgroup
+              );
+
+              code[base + 0] =
+                  (half)zmem[perm[k + 0]];
+
+              code[base + 1] =
+                  (half)zmem[perm[k + 1]];
+
+              code[base + 2] =
+                  (half)zmem[perm[k + 2]];
+
+              code[base + 3] =
+                  (half)zmem[perm[k + 3]];
+          }
+
+          '''
+
+          metal = (
+              metal[:start]
+              + new_kernel
+              + metal[end:]
+          )
+
+          metal_path.write_text(metal)
+
+
+          # ========================================================
+          # Patch Metal backend buffer bindings
+          # ========================================================
+
+          backend_path = Path(
+              "cactus-kernels/src/metal_backend.mm"
+          )
+
+          backend = backend_path.read_text()
+
+          start_marker = (
+              "bool cactus_metal_encode_transform_batch("
+          )
+
+          end_marker = (
+              "bool cactus_metal_encode_gemv_precoded("
+          )
+
+          start = backend.index(start_marker)
+          end = backend.index(end_marker, start)
+
+          new_backend = r'''bool cactus_metal_encode_transform_batch(
+              const void* x,
+              const CactusQuantMatrix* const* Ws,
+              int B,
+              void* const* codes)
+          {
+              if (
+                  !ctx().ok
+                  || B < 1
+                  || B > 3
+                  || !ctx().psoTbatch
+              ) {
+                  return false;
+              }
+
+              const uint32_t gs =
+                  Ws[0]->group_size;
+
+              const uint32_t K =
+                  Ws[0]->K;
+
+              const uint32_t ng =
+                  Ws[0]->num_groups;
+
+              if (
+                  gs != 128u
+                  || !quant_fast_eligible(Ws[0])
+              ) {
+                  return false;
+              }
+
+              ResW& r0 = resident(Ws[0]);
+
+              ResW* rw[3] = {
+                  &r0,
+                  &r0,
+                  &r0,
+              };
+
+              for (int b = 1; b < B; ++b) {
+                  rw[b] = &resident(Ws[b]);
+              }
+
+              for (int b = 0; b < B; ++b) {
+                  if (!rw[b]->ok) {
+                      return false;
+                  }
+              }
+
+              ensureEncoder();
+
+              [g_enc
+                  setComputePipelineState:
+                      ctx().psoTbatch];
+
+              setBufAt(
+                  x,
+                  (size_t)K * 2,
+                  0
+              );
+
+              /*
+               * Bind one reciprocal array per matrix.
+               *
+               * For unused slots when B < 3, reuse matrix 0.
+               * Those slots are never dispatched, but Metal still
+               * receives valid buffers for the complete signature.
+               */
+              for (int b = 0; b < 3; ++b) {
+                  ResW* R =
+                      rw[b < B ? b : 0];
+
+                  [g_enc
+                      setBuffer:R->recip
+                      offset:R->rc_off
+                      atIndex:1 + b];
+
+                  [g_enc
+                      setBuffer:R->lsign
+                      offset:R->ls_off
+                      atIndex:4 + b];
+
+                  [g_enc
+                      setBuffer:R->rsign
+                      offset:R->rs_off
+                      atIndex:7 + b];
+
+                  [g_enc
+                      setBuffer:R->perm
+                      offset:R->pm_off
+                      atIndex:10 + b];
+
+                  setBufAt(
+                      codes[b < B ? b : 0],
+                      (size_t)K * 2,
+                      13 + b
+                  );
+              }
+
+              [g_enc
+                  setBytes:&ng
+                  length:4
+                  atIndex:16];
+
+              [g_enc
+                  setThreadgroupMemoryLength:
+                      gs * sizeof(float)
+                  atIndex:0];
+
+              [g_enc
+                  dispatchThreadgroups:
+                      MTLSizeMake(
+                          (size_t)ng * B,
+                          1,
+                          1
+                      )
+                  threadsPerThreadgroup:
+                      MTLSizeMake(
+                          32,
+                          1,
+                          1
+                      )];
+
+              return true;
+          }
+
+          '''
+
+          backend = (
+              backend[:start]
+              + new_backend
+              + backend[end:]
+          )
+
+          backend_path.write_text(backend)
+
+          print("THREE_RECIP_PATCH_APPLIED=YES")
+          PY
+
+      # ============================================================
+      # 4. Inspect the exact diff before building
+      # ============================================================
+
+      - name: Print hypothesis patch
+        run: |
+          echo "=========================================="
+          echo "PATCH"
+          echo "=========================================="
+
+          git diff --check
+
+          git diff -- \
+            cactus-kernels/src/cactus_kernels.metal \
+            cactus-kernels/src/metal_backend.mm
+
+          echo
+          echo "=========================================="
+          echo "VERIFY RECIP BUFFER BINDINGS"
+          echo "=========================================="
+
+          grep -n -A90 \
+            "kernel void cq4_transform_batch" \
+            cactus-kernels/src/cactus_kernels.metal \
+            | head -100
+
+          echo
+
+          grep -n -A120 \
+            "bool cactus_metal_encode_transform_batch" \
+            cactus-kernels/src/metal_backend.mm \
+            | head -130
+
+      # ============================================================
+      # 5. Build patched Cactus
+      #
+      # CMake regenerates cactus_kernels_msl.h from the edited
+      # cactus_kernels.metal source during the build.
+      # ============================================================
+
+      - name: Setup and build patched Cactus
+        shell: bash
+        run: |
+          source ./setup
+
+          cactus build --python
+
+          echo
+          echo "=========================================="
+          echo "PATCHED CACTUS ENGINE"
+          echo "=========================================="
+
+          file \
+            cactus-engine/build/libcactus_engine.dylib
+
+          ls -lh \
+            cactus-engine/build/libcactus_engine.dylib
+
+      - name: Verify patched Metal backend
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          python - <<'PY'
+          from cactus.bindings import cactus as C
+
+          rc = C.cactus_set_backend("metal")
+
+          print(
+              "cactus_set_backend('metal') =",
+              rc
+          )
+
+          if rc != 0:
+              raise SystemExit(
+                  "Metal backend unavailable"
+              )
+
+          print(
+              "PATCHED_METAL_BACKEND=AVAILABLE"
+          )
+          PY
+
+      # ============================================================
+      # 6. Exact reporter harness
+      # ============================================================
+
+      - name: Install Hugging Face CLI
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          python -m pip install -U \
+            huggingface_hub
+
+      - name: Fetch pinned GSM8K harness
+        run: |
+          git clone \
+            https://github.com/john-rocky/apple-silicon-llm-bench.git \
+            "$RUNNER_TEMP/llm-bench"
+
+          cd "$RUNNER_TEMP/llm-bench"
+
+          git checkout \
+            fab4074629bd87116c405e5073f91bc3524b5eff
+
+          echo
+          echo "=========================================="
+          echo "HARNESS COMMIT"
+          echo "=========================================="
+
+          git rev-parse HEAD
+
+          mkdir -p \
+            "$RUNNER_TEMP/gsm8k_reports"
+
+      # ============================================================
+      # 7. BAD calibrated CQ4 only
+      #
+      # Known unpatched baseline on this SAME Cactus commit:
+      #
+      #   pred=16
+      #   gold=18
+      #   chars=4350
+      #   0/1
+      #
+      # If this becomes pred=18, that is the critical result.
+      # ============================================================
+
+      - name: Download BAD calibrated CQ4
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          mkdir -p \
+            "$RUNNER_TEMP/issue773"
+
+          hf download \
+            Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir \
+            "$RUNNER_TEMP/issue773"
+
+      - name: Verify BAD artifact hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | shasum -a 256 -c -
+
+      - name: Extract BAD CQ4
+        run: |
+          mkdir -p \
+            "$RUNNER_TEMP/bad_cq4"
+
+          unzip -q \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            -d "$RUNNER_TEMP/bad_cq4"
+
+          find \
+            "$RUNNER_TEMP/bad_cq4" \
+            -name config.txt
+
+      # ============================================================
+      # 8. Decisive Q1 run
+      # ============================================================
+
+      - name: Run BAD Q1 with three-recip fix
+        shell: bash
+        run: |
+          set -o pipefail
+
+          source venv/bin/activate
+
+          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
+          python \
+            "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle \
+            "$RUNNER_TEMP/bad_cq4/gemma-4-e2b-it-cq4-calibrated" \
+            --cactus-repo \
+            "$GITHUB_WORKSPACE" \
+            --cactus-backend metal \
+            --n 1 \
+            --max-tokens 1024 \
+            --tag \
+            bad-cq4-three-recip-fix-metal-q1 \
+            | tee patched_bad_q1.txt
+
+      # ============================================================
+      # 9. Print result
+      # ============================================================
+
+      - name: Print three-recip validation
+        run: |
+          echo
+          echo "=========================================="
+          echo "BASELINE"
+          echo "=========================================="
+          echo "Cactus commit:"
+          echo "c90a1afa4704574cef91ebfe29146902a0ab5209"
+          echo
+          echo "Unpatched BAD Metal Q1:"
+          echo "pred=16 gold=18 chars=4350"
+          echo
+
+          echo "=========================================="
+          echo "THREE-RECIP PATCHED RESULT"
+          echo "=========================================="
+
+          cat patched_bad_q1.txt
+
+          echo
+          echo "=========================================="
+          echo "RESULT JSON"
+          echo "=========================================="
+
+          cat \
+            "$RUNNER_TEMP/gsm8k_reports/gsm8k_bad-cq4-three-recip-fix-metal-q1.json"
+
+          echo
+          echo "=========================================="
+          echo "SOURCE DIFF"
+          echo "=========================================="
+
+          git diff -- \
+            cactus-kernels/src/cactus_kernels.metal \
+            cactus-kernels/src/metal_backend.mm
+
+      # ============================================================
+      # 10. Save evidence
+      # ============================================================
+
+      - name: Collect results
+        run: |
+          mkdir -p \
+            issue773_three_recip_results
+
+          cp patched_bad_q1.txt \
+            issue773_three_recip_results/
+
+          cp \
+            "$RUNNER_TEMP/gsm8k_reports/"*.json \
+            issue773_three_recip_results/
+
+          git diff -- \
+            cactus-kernels/src/cactus_kernels.metal \
+            cactus-kernels/src/metal_backend.mm \
+            > issue773_three_recip_results/three_recip.patch
+
+          git rev-parse HEAD \
+            > issue773_three_recip_results/baseline_commit.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue773-three-recip-q1
+          path: issue773_three_recip_results/
