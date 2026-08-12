@@ -1,0 +1,705 @@
+name: Issue 773 Metal Hybrid Bundle Probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - issue773-repro
+    paths:
+      - ".github/workflows/issue773-hybrid-metal.yml"
+
+jobs:
+  hybrid-metal-probe:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      # ============================================================
+      # 1. Reporter engine
+      # ============================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout reporter engine commit
+        run: |
+          git fetch https://github.com/cactus-compute/cactus.git \
+            1ace6d78767ab84e4ea3feb0d4d99a36ab884a3b
+
+          git checkout 1ace6d78767ab84e4ea3feb0d4d99a36ab884a3b
+
+          echo "===== CACTUS COMMIT ====="
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      # ============================================================
+      # 2. Metal / build
+      # ============================================================
+
+      - name: Show machine info
+        run: |
+          uname -a
+          uname -m
+          sw_vers
+          system_profiler SPHardwareDataType
+          system_profiler SPDisplaysDataType || true
+          df -h
+
+      - name: Verify Metal
+        run: |
+          cat > /tmp/metal_probe.swift <<'SWIFT'
+          import Foundation
+          import Metal
+
+          if let device = MTLCreateSystemDefaultDevice() {
+              print("METAL_AVAILABLE=YES")
+              print("METAL_DEVICE=\(device.name)")
+          } else {
+              print("METAL_AVAILABLE=NO")
+              exit(1)
+          }
+          SWIFT
+
+          swift /tmp/metal_probe.swift
+
+      - name: Install dependencies
+        run: |
+          brew install python@3.12 cmake
+
+      - name: Setup and build Cactus
+        shell: bash
+        run: |
+          source ./setup
+          cactus build --python
+
+          file cactus-engine/build/libcactus_engine.dylib
+
+      - name: Verify Cactus Metal backend
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          python - <<'PY'
+          from cactus.bindings import cactus as C
+
+          rc = C.cactus_set_backend("metal")
+          print("cactus_set_backend('metal') =", rc)
+
+          if rc != 0:
+              raise SystemExit("Metal backend rejected")
+
+          print("CACTUS_METAL_BACKEND=AVAILABLE")
+          PY
+
+      # ============================================================
+      # 3. Tooling + reporter harness
+      # ============================================================
+
+      - name: Install Hugging Face CLI
+        shell: bash
+        run: |
+          source venv/bin/activate
+          python -m pip install -U huggingface_hub
+
+      - name: Fetch pinned GSM8K harness
+        run: |
+          git clone \
+            https://github.com/john-rocky/apple-silicon-llm-bench.git \
+            "$RUNNER_TEMP/llm-bench"
+
+          cd "$RUNNER_TEMP/llm-bench"
+
+          git checkout fab4074629bd87116c405e5073f91bc3524b5eff
+
+          echo "===== HARNESS COMMIT ====="
+          git rev-parse HEAD
+
+          mkdir -p "$RUNNER_TEMP/gsm8k_reports"
+
+      # ============================================================
+      # 4. Hybrid bundle helper
+      #
+      # It strips each ZIP's top-level directory.
+      #
+      # Example:
+      #   bad.zip/foo/layer_0.weights
+      # becomes:
+      #   HYBRID/layer_0.weights
+      #
+      # The helper also REFUSES to make a hybrid unless both bundles
+      # have exactly the same .weights paths and sizes.
+      # ============================================================
+
+      - name: Write hybrid bundle helper
+        run: |
+          cat > /tmp/make_hybrid.py <<'PY'
+          import argparse
+          import shutil
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+
+          def relative_path(name):
+              parts = PurePosixPath(name).parts
+
+              if len(parts) < 2:
+                  return None
+
+              rel = PurePosixPath(*parts[1:])
+
+              if ".." in rel.parts:
+                  raise RuntimeError(f"unsafe zip path: {name}")
+
+              return rel
+
+
+          def weight_inventory(zip_path):
+              result = {}
+
+              with zipfile.ZipFile(zip_path) as zf:
+                  for info in zf.infolist():
+                      if info.is_dir():
+                          continue
+
+                      rel = relative_path(info.filename)
+
+                      if rel is None:
+                          continue
+
+                      rel_str = str(rel)
+
+                      if rel_str.endswith(".weights"):
+                          result[rel_str] = info.file_size
+
+              return result
+
+
+          def verify_weight_layout(base_zip, donor_zip):
+              base = weight_inventory(base_zip)
+              donor = weight_inventory(donor_zip)
+
+              print(f"Base weight files : {len(base)}")
+              print(f"Donor weight files: {len(donor)}")
+
+              only_base = sorted(set(base) - set(donor))
+              only_donor = sorted(set(donor) - set(base))
+
+              size_mismatch = sorted(
+                  p for p in set(base) & set(donor)
+                  if base[p] != donor[p]
+              )
+
+              if only_base:
+                  print("Weights only in base:")
+                  for p in only_base[:20]:
+                      print("  ", p)
+
+              if only_donor:
+                  print("Weights only in donor:")
+                  for p in only_donor[:20]:
+                      print("  ", p)
+
+              if size_mismatch:
+                  print("Weight size mismatches:")
+                  for p in size_mismatch[:20]:
+                      print(
+                          f"  {p}: "
+                          f"base={base[p]} donor={donor[p]}"
+                      )
+
+              if only_base or only_donor or size_mismatch:
+                  raise RuntimeError(
+                      "Weight layouts are not interchangeable; "
+                      "refusing to create hybrid"
+                  )
+
+              print(
+                  "WEIGHT_LAYOUT_COMPATIBLE=YES "
+                  f"({len(base)} files)"
+              )
+
+
+          def extract_base(zip_path, output):
+              output = Path(output)
+
+              if output.exists():
+                  shutil.rmtree(output)
+
+              output.mkdir(parents=True)
+
+              count = 0
+
+              with zipfile.ZipFile(zip_path) as zf:
+                  for info in zf.infolist():
+                      if info.is_dir():
+                          continue
+
+                      rel = relative_path(info.filename)
+
+                      if rel is None:
+                          continue
+
+                      target = output / Path(*rel.parts)
+                      target.parent.mkdir(
+                          parents=True,
+                          exist_ok=True,
+                      )
+
+                      with zf.open(info) as src, \
+                           target.open("wb") as dst:
+                          shutil.copyfileobj(
+                              src,
+                              dst,
+                              length=8 * 1024 * 1024,
+                          )
+
+                      count += 1
+
+              print(f"Extracted {count} base files")
+
+
+          def overlay_weights(donor_zip, output):
+              output = Path(output)
+              count = 0
+
+              with zipfile.ZipFile(donor_zip) as zf:
+                  for info in zf.infolist():
+                      if info.is_dir():
+                          continue
+
+                      rel = relative_path(info.filename)
+
+                      if rel is None:
+                          continue
+
+                      if not str(rel).endswith(".weights"):
+                          continue
+
+                      target = output / Path(*rel.parts)
+
+                      if not target.exists():
+                          raise RuntimeError(
+                              f"base missing donor weight: {rel}"
+                          )
+
+                      if target.stat().st_size != info.file_size:
+                          raise RuntimeError(
+                              f"size mismatch for {rel}: "
+                              f"base={target.stat().st_size}, "
+                              f"donor={info.file_size}"
+                          )
+
+                      with zf.open(info) as src, \
+                           target.open("wb") as dst:
+                          shutil.copyfileobj(
+                              src,
+                              dst,
+                              length=8 * 1024 * 1024,
+                          )
+
+                      count += 1
+
+              print(f"Overlaid {count} donor weight files")
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+
+              ap.add_argument("--base", required=True)
+              ap.add_argument("--donor", required=True)
+              ap.add_argument("--output", required=True)
+
+              args = ap.parse_args()
+
+              verify_weight_layout(
+                  args.base,
+                  args.donor,
+              )
+
+              extract_base(
+                  args.base,
+                  args.output,
+              )
+
+              overlay_weights(
+                  args.donor,
+                  args.output,
+              )
+
+              print(f"HYBRID_READY={args.output}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      # ============================================================
+      # 5. HYBRID A
+      #
+      # BAD shell / graphs / configs
+      # GOOD weights
+      # ============================================================
+
+      - name: Download BAD base for Hybrid A
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          mkdir -p "$RUNNER_TEMP/issue773"
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | shasum -a 256 -c -
+
+      - name: Extract BAD shell for Hybrid A
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "/tmp")
+          import make_hybrid
+
+          make_hybrid.extract_base(
+              "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip",
+              "$RUNNER_TEMP/hybrid_bad_shell_good_weights",
+          )
+          PY
+
+          rm -f \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
+
+          df -h
+
+      - name: Download GOOD donor weights for Hybrid A
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4-uncalibrated.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
+          | shasum -a 256 -c -
+
+      - name: Overlay GOOD weights onto BAD shell
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "/tmp")
+          import make_hybrid
+
+          base_zip = \
+              "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
+
+          hybrid = \
+              "$RUNNER_TEMP/hybrid_bad_shell_good_weights"
+
+          donor_inventory = make_hybrid.weight_inventory(
+              base_zip
+          )
+
+          current_inventory = {}
+
+          from pathlib import Path
+
+          for p in Path(hybrid).rglob("*.weights"):
+              current_inventory[
+                  str(p.relative_to(hybrid))
+              ] = p.stat().st_size
+
+          only_hybrid = (
+              set(current_inventory)
+              - set(donor_inventory)
+          )
+
+          only_donor = (
+              set(donor_inventory)
+              - set(current_inventory)
+          )
+
+          mismatched = {
+              p for p in (
+                  set(current_inventory)
+                  & set(donor_inventory)
+              )
+              if current_inventory[p]
+              != donor_inventory[p]
+          }
+
+          print(
+              "Hybrid shell weights:",
+              len(current_inventory),
+          )
+          print(
+              "GOOD donor weights:",
+              len(donor_inventory),
+          )
+
+          if only_hybrid or only_donor or mismatched:
+              print(
+                  "only_hybrid =",
+                  sorted(only_hybrid)[:20],
+              )
+              print(
+                  "only_donor =",
+                  sorted(only_donor)[:20],
+              )
+              print(
+                  "size_mismatch =",
+                  sorted(mismatched)[:20],
+              )
+              raise SystemExit(
+                  "Weight layouts incompatible"
+              )
+
+          print("WEIGHT_LAYOUT_COMPATIBLE=YES")
+
+          make_hybrid.overlay_weights(
+              base_zip,
+              hybrid,
+          )
+          PY
+
+          rm -f \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
+
+          df -h
+
+      - name: Run Hybrid A GSM8K Q1 on Metal
+        shell: bash
+        run: |
+          set -o pipefail
+          source venv/bin/activate
+
+          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/hybrid_bad_shell_good_weights" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend metal \
+            --n 1 \
+            --max-tokens 1024 \
+            --tag hybrid-bad-shell-good-weights \
+            | tee hybrid_a.txt
+
+      - name: Remove Hybrid A
+        run: |
+          rm -rf \
+            "$RUNNER_TEMP/hybrid_bad_shell_good_weights"
+
+          df -h
+
+      # ============================================================
+      # 6. HYBRID B
+      #
+      # GOOD shell / graphs / configs
+      # BAD weights
+      # ============================================================
+
+      - name: Download GOOD base for Hybrid B
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4-uncalibrated.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
+          | shasum -a 256 -c -
+
+      - name: Extract GOOD shell for Hybrid B
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "/tmp")
+          import make_hybrid
+
+          make_hybrid.extract_base(
+              "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip",
+              "$RUNNER_TEMP/hybrid_good_shell_bad_weights",
+          )
+          PY
+
+          rm -f \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
+
+          df -h
+
+      - name: Download BAD donor weights for Hybrid B
+        shell: bash
+        run: |
+          source venv/bin/activate
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | shasum -a 256 -c -
+
+      - name: Overlay BAD weights onto GOOD shell
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "/tmp")
+          import make_hybrid
+
+          donor_zip = \
+              "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
+
+          hybrid = \
+              "$RUNNER_TEMP/hybrid_good_shell_bad_weights"
+
+          donor_inventory = make_hybrid.weight_inventory(
+              donor_zip
+          )
+
+          current_inventory = {}
+
+          from pathlib import Path
+
+          for p in Path(hybrid).rglob("*.weights"):
+              current_inventory[
+                  str(p.relative_to(hybrid))
+              ] = p.stat().st_size
+
+          only_hybrid = (
+              set(current_inventory)
+              - set(donor_inventory)
+          )
+
+          only_donor = (
+              set(donor_inventory)
+              - set(current_inventory)
+          )
+
+          mismatched = {
+              p for p in (
+                  set(current_inventory)
+                  & set(donor_inventory)
+              )
+              if current_inventory[p]
+              != donor_inventory[p]
+          }
+
+          print(
+              "Hybrid shell weights:",
+              len(current_inventory),
+          )
+          print(
+              "BAD donor weights:",
+              len(donor_inventory),
+          )
+
+          if only_hybrid or only_donor or mismatched:
+              print(
+                  "only_hybrid =",
+                  sorted(only_hybrid)[:20],
+              )
+              print(
+                  "only_donor =",
+                  sorted(only_donor)[:20],
+              )
+              print(
+                  "size_mismatch =",
+                  sorted(mismatched)[:20],
+              )
+              raise SystemExit(
+                  "Weight layouts incompatible"
+              )
+
+          print("WEIGHT_LAYOUT_COMPATIBLE=YES")
+
+          make_hybrid.overlay_weights(
+              donor_zip,
+              hybrid,
+          )
+          PY
+
+          rm -f \
+            "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
+
+          df -h
+
+      - name: Run Hybrid B GSM8K Q1 on Metal
+        shell: bash
+        run: |
+          set -o pipefail
+          source venv/bin/activate
+
+          GSM8K_REPORTS="$RUNNER_TEMP/gsm8k_reports" \
+          python "$RUNNER_TEMP/llm-bench/scripts/parity_gsm8k.py" \
+            --which cactus \
+            --bundle "$RUNNER_TEMP/hybrid_good_shell_bad_weights" \
+            --cactus-repo "$GITHUB_WORKSPACE" \
+            --cactus-backend metal \
+            --n 1 \
+            --max-tokens 1024 \
+            --tag hybrid-good-shell-bad-weights \
+            | tee hybrid_b.txt
+
+      # ============================================================
+      # 7. Compare
+      # ============================================================
+
+      - name: Print hybrid comparison
+        run: |
+          echo
+          echo "=========================================="
+          echo "HYBRID A: BAD SHELL + GOOD WEIGHTS"
+          echo "=========================================="
+          cat hybrid_a.txt
+
+          echo
+          echo "=========================================="
+          echo "HYBRID B: GOOD SHELL + BAD WEIGHTS"
+          echo "=========================================="
+          cat hybrid_b.txt
+
+          echo
+          echo "=========================================="
+          echo "RESULT JSON"
+          echo "=========================================="
+
+          cat \
+            "$RUNNER_TEMP/gsm8k_reports/gsm8k_hybrid-bad-shell-good-weights.json"
+
+          echo
+
+          cat \
+            "$RUNNER_TEMP/gsm8k_reports/gsm8k_hybrid-good-shell-bad-weights.json"
+
+      - name: Collect results
+        run: |
+          mkdir -p issue773_hybrid_results
+
+          cp hybrid_a.txt \
+            issue773_hybrid_results/
+
+          cp hybrid_b.txt \
+            issue773_hybrid_results/
+
+          cp "$RUNNER_TEMP/gsm8k_reports/"*.json \
+            issue773_hybrid_results/
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue773-metal-hybrid-q1
+          path: issue773_hybrid_results/

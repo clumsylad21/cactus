@@ -2,9 +2,6 @@ name: Issue 773 Metal GSM8K n5 Repro
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - issue773-repro
 
 jobs:
   metal-gsm8k-n5:
