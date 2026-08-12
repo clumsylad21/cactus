@@ -1,0 +1,498 @@
+name: Issue 773 CQ4 Artifact Diff
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - issue773-repro
+    paths:
+      - ".github/workflows/issue773-artifact-diff.yml"
+
+jobs:
+  artifact-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # ============================================================
+      # 1. Setup
+      # ============================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Hugging Face tooling
+        run: |
+          python -m pip install -U huggingface_hub
+
+      # ============================================================
+      # 2. Write artifact inspection script
+      # ============================================================
+
+      - name: Write artifact inspector
+        run: |
+          cat > /tmp/inspect_bundle.py <<'PY'
+          import argparse
+          import hashlib
+          import json
+          import zipfile
+          from pathlib import Path
+
+
+          CHUNK = 8 * 1024 * 1024
+
+          TEXT_SUFFIXES = {
+              ".json",
+              ".txt",
+              ".yaml",
+              ".yml",
+              ".toml",
+              ".cfg",
+              ".ini",
+          }
+
+
+          def sha256_stream(f):
+              h = hashlib.sha256()
+
+              while True:
+                  chunk = f.read(CHUNK)
+                  if not chunk:
+                      break
+
+                  h.update(chunk)
+
+              return h.hexdigest()
+
+
+          def is_weight(path):
+              return path.lower().endswith(".weights")
+
+
+          def maybe_text(path, size):
+              p = Path(path)
+
+              if size > 256 * 1024:
+                  return False
+
+              if p.name == "config.txt":
+                  return True
+
+              return p.suffix.lower() in TEXT_SUFFIXES
+
+
+          def inspect(zip_path, label, output):
+              rows = []
+              text_files = {}
+
+              print(f"Inspecting {zip_path}")
+
+              with zipfile.ZipFile(zip_path) as z:
+                  members = [
+                      info for info in z.infolist()
+                      if not info.is_dir()
+                  ]
+
+                  print(f"{label}: {len(members)} files")
+
+                  for i, info in enumerate(members, 1):
+                      with z.open(info) as f:
+                          digest = sha256_stream(f)
+
+                      row = {
+                          "path": info.filename,
+                          "size": info.file_size,
+                          "compressed_size": info.compress_size,
+                          "crc32": f"{info.CRC:08x}",
+                          "sha256": digest,
+                          "is_weight": is_weight(info.filename),
+                      }
+
+                      rows.append(row)
+
+                      if maybe_text(info.filename, info.file_size):
+                          try:
+                              with z.open(info) as f:
+                                  text_files[info.filename] = (
+                                      f.read().decode("utf-8")
+                                  )
+                          except Exception:
+                              pass
+
+                      if i % 100 == 0 or i == len(members):
+                          print(
+                              f"{label}: hashed "
+                              f"{i}/{len(members)} files"
+                          )
+
+              manifest = {
+                  "label": label,
+                  "archive": str(zip_path),
+                  "file_count": len(rows),
+                  "files": rows,
+                  "text_files": text_files,
+              }
+
+              Path(output).write_text(
+                  json.dumps(manifest, indent=2)
+              )
+
+              print(f"Wrote {output}")
+
+
+          if __name__ == "__main__":
+              ap = argparse.ArgumentParser()
+
+              ap.add_argument("--zip", required=True)
+              ap.add_argument("--label", required=True)
+              ap.add_argument("--output", required=True)
+
+              args = ap.parse_args()
+
+              inspect(
+                  args.zip,
+                  args.label,
+                  args.output,
+              )
+          PY
+
+      # ============================================================
+      # 3. BAD calibrated artifact
+      # ============================================================
+
+      - name: Download BAD calibrated CQ4
+        run: |
+          mkdir -p "$RUNNER_TEMP/issue773"
+          mkdir -p issue773_artifact_diff
+
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify BAD archive hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7a2579ad1089f626b15e121a1fa6a0d8294a4e7f1f7af38823620b5b5a8b8eec  gemma-4-e2b-it-cq4.zip" \
+          | sha256sum -c -
+
+      - name: Inspect BAD artifact
+        run: |
+          python /tmp/inspect_bundle.py \
+            --zip "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip" \
+            --label bad-calibrated \
+            --output issue773_artifact_diff/bad_manifest.json
+
+      - name: Remove BAD archive
+        run: |
+          rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4.zip"
+          df -h
+
+      # ============================================================
+      # 4. GOOD uncalibrated artifact
+      # ============================================================
+
+      - name: Download GOOD uncalibrated CQ4
+        run: |
+          hf download Cactus-Compute/gemma-4-E2B-it \
+            gemma-4-e2b-it-cq4-uncalibrated.zip \
+            --local-dir "$RUNNER_TEMP/issue773"
+
+      - name: Verify GOOD archive hash
+        run: |
+          cd "$RUNNER_TEMP/issue773"
+
+          echo \
+          "7c71f075554bd27bd443f75ff2012b95be30f0254f7d864642ee89d3b706d980  gemma-4-e2b-it-cq4-uncalibrated.zip" \
+          | sha256sum -c -
+
+      - name: Inspect GOOD artifact
+        run: |
+          python /tmp/inspect_bundle.py \
+            --zip "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip" \
+            --label good-uncalibrated \
+            --output issue773_artifact_diff/good_manifest.json
+
+      - name: Remove GOOD archive
+        run: |
+          rm -f "$RUNNER_TEMP/issue773/gemma-4-e2b-it-cq4-uncalibrated.zip"
+          df -h
+
+      # ============================================================
+      # 5. Compare manifests
+      # ============================================================
+
+      - name: Compare artifact contents
+        run: |
+          cat > /tmp/compare_bundles.py <<'PY'
+          import difflib
+          import json
+          from pathlib import Path
+
+
+          bad = json.loads(
+              Path(
+                  "issue773_artifact_diff/bad_manifest.json"
+              ).read_text()
+          )
+
+          good = json.loads(
+              Path(
+                  "issue773_artifact_diff/good_manifest.json"
+              ).read_text()
+          )
+
+
+          bad_files = {
+              x["path"]: x
+              for x in bad["files"]
+          }
+
+          good_files = {
+              x["path"]: x
+              for x in good["files"]
+          }
+
+
+          bad_paths = set(bad_files)
+          good_paths = set(good_files)
+
+          only_bad = sorted(bad_paths - good_paths)
+          only_good = sorted(good_paths - bad_paths)
+
+          common = sorted(bad_paths & good_paths)
+
+          identical = []
+          changed = []
+
+          for path in common:
+              if (
+                  bad_files[path]["sha256"]
+                  == good_files[path]["sha256"]
+              ):
+                  identical.append(path)
+              else:
+                  changed.append(path)
+
+
+          changed_weights = [
+              p for p in changed
+              if bad_files[p]["is_weight"]
+              or good_files[p]["is_weight"]
+          ]
+
+          changed_nonweights = [
+              p for p in changed
+              if p not in changed_weights
+          ]
+
+          size_changed = [
+              p for p in changed
+              if bad_files[p]["size"]
+              != good_files[p]["size"]
+          ]
+
+
+          lines = []
+
+          def emit(s=""):
+              print(s)
+              lines.append(s)
+
+
+          emit("==========================================")
+          emit("ISSUE 773 CQ4 ARTIFACT STRUCTURAL DIFF")
+          emit("==========================================")
+          emit()
+
+          emit(
+              f"BAD files:  {len(bad_files)}"
+          )
+          emit(
+              f"GOOD files: {len(good_files)}"
+          )
+          emit()
+
+          emit(
+              f"Common paths:                 {len(common)}"
+          )
+          emit(
+              f"Byte-identical common files: {len(identical)}"
+          )
+          emit(
+              f"Changed common files:        {len(changed)}"
+          )
+          emit(
+              f"Only in BAD:                  {len(only_bad)}"
+          )
+          emit(
+              f"Only in GOOD:                 {len(only_good)}"
+          )
+          emit()
+
+          emit(
+              f"Changed weight files:         {len(changed_weights)}"
+          )
+          emit(
+              f"Changed non-weight files:     {len(changed_nonweights)}"
+          )
+          emit(
+              f"Changed files with new size:  {len(size_changed)}"
+          )
+          emit()
+
+
+          emit("==========================================")
+          emit("FILES ONLY IN BAD")
+          emit("==========================================")
+
+          if only_bad:
+              for p in only_bad:
+                  emit(p)
+          else:
+              emit("(none)")
+
+          emit()
+
+
+          emit("==========================================")
+          emit("FILES ONLY IN GOOD")
+          emit("==========================================")
+
+          if only_good:
+              for p in only_good:
+                  emit(p)
+          else:
+              emit("(none)")
+
+          emit()
+
+
+          emit("==========================================")
+          emit("CHANGED NON-WEIGHT FILES")
+          emit("==========================================")
+
+          if not changed_nonweights:
+              emit("(none)")
+
+          for p in changed_nonweights:
+              b = bad_files[p]
+              g = good_files[p]
+
+              emit(p)
+              emit(
+                  f"  BAD : size={b['size']} "
+                  f"sha256={b['sha256']}"
+              )
+              emit(
+                  f"  GOOD: size={g['size']} "
+                  f"sha256={g['sha256']}"
+              )
+
+          emit()
+
+
+          emit("==========================================")
+          emit("CHANGED WEIGHT FILES")
+          emit("==========================================")
+          emit(
+              f"Total changed weight files: "
+              f"{len(changed_weights)}"
+          )
+
+          for p in changed_weights[:100]:
+              b = bad_files[p]
+              g = good_files[p]
+
+              marker = (
+                  "SIZE_CHANGED"
+                  if b["size"] != g["size"]
+                  else "same-size"
+              )
+
+              emit(
+                  f"{p} | "
+                  f"{b['size']} -> {g['size']} | "
+                  f"{marker}"
+              )
+
+          if len(changed_weights) > 100:
+              emit(
+                  f"... {len(changed_weights) - 100} "
+                  f"more changed weight files omitted"
+              )
+
+          emit()
+
+
+          emit("==========================================")
+          emit("TEXT / CONFIG DIFFS")
+          emit("==========================================")
+
+          bad_text = bad.get("text_files", {})
+          good_text = good.get("text_files", {})
+
+          text_common = sorted(
+              set(bad_text) & set(good_text)
+          )
+
+          any_text_diff = False
+
+          for p in text_common:
+              if bad_text[p] == good_text[p]:
+                  continue
+
+              any_text_diff = True
+
+              emit()
+              emit(f"--- {p} ---")
+
+              diff = difflib.unified_diff(
+                  good_text[p].splitlines(),
+                  bad_text[p].splitlines(),
+                  fromfile=f"GOOD/{p}",
+                  tofile=f"BAD/{p}",
+                  lineterm="",
+              )
+
+              for line in diff:
+                  emit(line)
+
+          if not any_text_diff:
+              emit(
+                  "(no differences among captured small text/config files)"
+              )
+
+
+          Path(
+              "issue773_artifact_diff/summary.txt"
+          ).write_text(
+              "\n".join(lines) + "\n"
+          )
+          PY
+
+          python /tmp/compare_bundles.py
+
+      # ============================================================
+      # 6. Print useful summary directly in Actions
+      # ============================================================
+
+      - name: Print artifact diff summary
+        run: |
+          cat issue773_artifact_diff/summary.txt
+
+      # ============================================================
+      # 7. Save everything
+      # ============================================================
+
+      - name: Upload artifact diff
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue773-cq4-artifact-diff
+          path: issue773_artifact_diff/
